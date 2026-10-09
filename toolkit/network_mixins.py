@@ -536,7 +536,9 @@ class ToolkitNetworkMixin:
 
         for key in list(state_dict.keys()):
             v = state_dict[key]
-            v = v.detach().clone().to("cpu").to(dtype)
+            # cast where the tensor lives (fast on the GPU), then a private CPU copy: copy=True
+            # because .to("cpu") would alias a tensor that is already on the CPU in this dtype
+            v = v.detach().to(dtype=dtype).to("cpu", copy=True)
             save_key = save_keymap[key] if key in save_keymap else key
             save_dict[save_key] = v
             del state_dict[key]
@@ -545,7 +547,7 @@ class ToolkitNetworkMixin:
             # add extra items to state dict
             for key in list(extra_state_dict.keys()):
                 v = extra_state_dict[key]
-                v = v.detach().clone().to("cpu").to(dtype)
+                v = v.detach().to(dtype=dtype).to("cpu", copy=True)
                 save_dict[key] = v
 
         if self.peft_format:
@@ -715,7 +717,15 @@ class ToolkitNetworkMixin:
         for key in to_delete:
             del load_sd[key]
 
-        print(f"Missing keys: {to_delete}")
+        # NOTE: `to_delete` is keys present in the FILE that this network does NOT
+        # have -- i.e. EXTRA/ignored keys, not missing ones. The old "Missing keys"
+        # label read as the opposite and sent a real debugging session down the wrong
+        # path (a fully-correct LoRA reports these whenever the file covers modules
+        # the network did not build, e.g. transformer_only=true dropping the 8
+        # top-level Krea2 modules).
+        if len(to_delete) > 0:
+            print(f"Ignored {len(to_delete)} key(s) present in the file but not in this "
+                  f"network (extra, NOT missing): {to_delete}")
         if len(to_delete) > 0 and self.is_v1 and not force_weight_mapping and not (
                 len(to_delete) == 1 and 'emb_params' in to_delete):
             print(" Attempting to load with forced keymap")

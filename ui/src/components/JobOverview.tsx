@@ -4,6 +4,7 @@ import useCPUInfo from '@/hooks/useCPUInfo';
 import GPUWidget from '@/components/GPUWidget';
 import CPUWidget from '@/components/CPUWidget';
 import FilesWidget from '@/components/FilesWidget';
+import CurrentStepImages from '@/components/CurrentStepImages';
 import { getTotalSteps } from '@/utils/jobs';
 import { Cpu, HardDrive, Info, Gauge } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -15,7 +16,7 @@ interface JobOverviewProps {
 
 export default function JobOverview({ job }: JobOverviewProps) {
   const gpuIds = useMemo(() => job.gpu_ids.split(',').map(id => parseInt(id)), [job.gpu_ids]);
-  const { log, setLog, status: statusLog, refresh: refreshLog } = useJobLog(job.id, 2000);
+  const { log, status: statusLog } = useJobLog(job.id, 2000);
   const logRef = useRef<HTMLDivElement>(null);
   // Track whether we should auto-scroll to bottom
   const [isScrolledToBottom, setIsScrolledToBottom] = useState(true);
@@ -25,6 +26,18 @@ export default function JobOverview({ job }: JobOverviewProps) {
   const totalSteps = getTotalSteps(job);
   const progress = (job.step / totalSteps) * 100;
   const isStopping = job.stop && job.status === 'running';
+  const trainingPerformanceLines = useMemo(() => {
+    return job.speed_string
+      .split('|')
+      .map(part => part.trim())
+      .filter(part => part.length > 0);
+  }, [job.speed_string]);
+  const cachePerformanceLines = useMemo(() => {
+    return job.cache_speed_string
+      .split('|')
+      .map(part => part.trim())
+      .filter(part => part.length > 0);
+  }, [job.cache_speed_string]);
 
   const logLines: string[] = useMemo(() => {
     // split at line breaks on \n or \r\n but not \r
@@ -34,7 +47,7 @@ export default function JobOverview({ job }: JobOverviewProps) {
       return line.split(/\r/).pop();
     }) as string[];
 
-    // only return last 100 lines max
+    // only return last 1000 lines max
     const maxLines = 1000;
     if (splits.length > maxLines) {
       splits = splits.slice(splits.length - maxLines);
@@ -85,12 +98,12 @@ export default function JobOverview({ job }: JobOverviewProps) {
   return (
     <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
       {/* Job Information Panel */}
-      <div className="col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
+      <div className="md:col-span-2 bg-gray-900 rounded-xl shadow-lg overflow-hidden border border-gray-800 flex flex-col">
         <div className="bg-gray-800 px-4 py-3 flex items-center justify-between">
           <h2 className="text-gray-100">
             <Info className="w-5 h-5 mr-2 -mt-1 text-amber-400 inline-block" /> {job.info}
           </h2>
-          <span className={`px-3 py-1 rounded-full text-sm ${getStatusColor(job.status)}`}>{job.status}</span>
+          <span className={`px-3 py-1 rounded-full text-sm ${getStatusColor(status)}`}>{status}</span>
         </div>
 
         <div className="p-4 space-y-6 flex flex-col flex-grow">
@@ -128,8 +141,33 @@ export default function JobOverview({ job }: JobOverviewProps) {
             <div className="flex items-center space-x-4">
               <Gauge className="w-5 h-5 text-green-400" />
               <div>
-                <p className="text-xs text-gray-400">Speed</p>
-                <p className="text-sm font-medium text-gray-200">{job.speed_string == '' ? '?' : job.speed_string}</p>
+                <p className="text-xs text-gray-400">Performance</p>
+                {trainingPerformanceLines.length === 0 && cachePerformanceLines.length === 0 ? (
+                  <p className="text-sm font-medium text-gray-200">?</p>
+                ) : (
+                  <div className="space-y-0.5">
+                    {trainingPerformanceLines.length > 0 ? (
+                      <div>
+                        <p className="text-xs text-gray-500">Training</p>
+                        {trainingPerformanceLines.map((line, index) => (
+                          <p key={`train-${index}`} className="text-sm font-medium text-gray-200 break-words">
+                            {line}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                    {cachePerformanceLines.length > 0 ? (
+                      <div className={trainingPerformanceLines.length > 0 ? 'pt-1' : ''}>
+                        <p className="text-xs text-gray-500">Caching</p>
+                        {cachePerformanceLines.map((line, index) => (
+                          <p key={`cache-${index}`} className="text-sm font-medium text-gray-200 break-words">
+                            {line}
+                          </p>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -163,6 +201,9 @@ export default function JobOverview({ job }: JobOverviewProps) {
           <FilesWidget jobID={job.id} />
         </div>
       </div>
+
+      {/* Images of the step being trained (full width, under the log) */}
+      <CurrentStepImages job={job} />
     </div>
   );
 }

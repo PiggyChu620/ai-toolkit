@@ -406,6 +406,9 @@ class Automagic(torch.optim.Optimizer):
             try:
                 # Make sure the shapes match
                 if 'quantized' in saved_lr_mask and saved_lr_mask['quantized'].shape == current_param.shape:
+                    # optimizer.pt may hold CPU copies (checkpoints are written in the background)
+                    saved_lr_mask = {key: (value.to(current_param.device) if torch.is_tensor(value) else value)
+                                     for key, value in saved_lr_mask.items()}
                     current_state['lr_mask'] = Auto8bitTensor(saved_lr_mask)
                 else:
                     print(f"WARNING: Shape mismatch for parameter {i}. "

@@ -1,5 +1,9 @@
 import torch
-from toolkit.models.wan21.wan_utils import add_first_frame_conditioning
+from toolkit.models.wan21.wan_utils import (
+    add_first_frame_conditioning,
+    apply_first_frame_condition,
+    encode_first_frame_condition,
+)
 from toolkit.prompt_utils import PromptEmbeds
 from PIL import Image
 import torch
@@ -14,6 +18,38 @@ from .wan22_14b_model import Wan2214bModel
 
 class Wan2214bI2VModel(Wan2214bModel):
     arch = "wan22_14b_i2v"
+
+    def uses_i2v_first_frame_conditions(self) -> bool:
+        return True
+
+    @torch.no_grad()
+    def build_i2v_first_frame_conditions(
+        self,
+        latents: torch.Tensor,
+        first_frames: torch.Tensor,
+        first_frame_latents: torch.Tensor = None,
+        device=None,
+        dtype=None,
+    ):
+        target_device = device if device is not None else latents.device
+        target_dtype = dtype if dtype is not None else latents.dtype
+
+        # Only move the VAE if it was offloaded to CPU, and restore it afterward so
+        # the low-VRAM offload isn't defeated (during latent caching the VAE is
+        # already on-device, so this is a no-op there and adds no transfers).
+        vae_was_on_cpu = self.vae.device == torch.device("cpu")
+        if vae_was_on_cpu:
+            self.vae.to(target_device)
+
+        try:
+            return encode_first_frame_condition(
+                latent_model_input=latents.to(target_device, dtype=target_dtype),
+                first_frame=first_frames.to(target_device, dtype=target_dtype),
+                vae=self.vae,
+            )
+        finally:
+            if vae_was_on_cpu:
+                self.vae.to("cpu")
     
     
     def generate_single_image(
@@ -119,21 +155,34 @@ class Wan2214bI2VModel(Wan2214bModel):
         # videos come in (bs, num_frames, channels, height, width)
         # images come in (bs, channels, height, width)
         with torch.no_grad():
-            frames = batch.tensor
-            if len(frames.shape) == 4:
-                first_frames = frames
-            elif len(frames.shape) == 5:
-                first_frames = frames[:, 0]
+            if batch.first_frame_conditions is not None:
+                conditioned_latent = apply_first_frame_condition(
+                    latent_model_input=latent_model_input,
+                    first_frame_condition=batch.first_frame_conditions.to(
+                        self.device_torch,
+                        dtype=self.torch_dtype,
+                    ),
+                )
             else:
-                raise ValueError(f"Unknown frame shape {frames.shape}")
-            
-            # Add conditioning using the standalone function
-            conditioned_latent = add_first_frame_conditioning(
-                latent_model_input=latent_model_input,
-                first_frame=first_frames,
-                vae=self.vae
-            )
-        
+                frames = batch.tensor
+                if frames is None:
+                    raise ValueError(
+                        "Wan 2.2 14B I2V requires cached first-frame conditions or source frames."
+                    )
+                if len(frames.shape) == 4:
+                    first_frames = frames
+                elif len(frames.shape) == 5:
+                    first_frames = frames[:, 0]
+                else:
+                    raise ValueError(f"Unknown frame shape {frames.shape}")
+
+                # Add conditioning using the standalone function
+                conditioned_latent = add_first_frame_conditioning(
+                    latent_model_input=latent_model_input,
+                    first_frame=first_frames,
+                    vae=self.vae
+                )
+
         noise_pred = self.model(
             hidden_states=conditioned_latent,
             timestep=timestep,

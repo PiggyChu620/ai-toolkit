@@ -67,9 +67,22 @@ export interface NetworkConfig {
   conv_alpha: number;
   lokr_full_rank: boolean;
   lokr_factor: number;
+  pretrained_lora_path?: string;
+  resume_training_state?: boolean;
   network_kwargs: {
     ignore_if_contains: string[];
   };
+}
+
+export interface AdapterConfig {
+  type: string;
+  train: boolean;
+  image_encoder_path?: string;
+  image_encoder_arch?: string;
+  train_image_encoder?: boolean;
+  train_only_image_encoder?: boolean;
+  clip_layer?: string;
+  test_img_path?: string[];
 }
 
 export interface SaveConfig {
@@ -86,11 +99,27 @@ export interface DatasetConfig {
   mask_min_value: number;
   default_caption: string;
   caption_ext: string;
+  must_include_caption?: boolean;
   caption_dropout_rate: number;
   shuffle_tokens?: boolean;
   is_reg: boolean;
   network_weight: number;
+  cache_latents?: boolean;
   cache_latents_to_disk?: boolean;
+  lazy_cache_latents?: boolean;
+  caches_only?: boolean;
+  lazy_cache_text_embeddings?: boolean;
+  text_embedding_cache_shard_size?: number;
+  cache_dir_override?: string | null;
+  cache_dir_override_min_free_gb?: number;
+  clip_image_path?: string | null;
+  clip_image_from_same_folder?: boolean;
+  clip_image_from_same_folder_balanced?: boolean;
+  num_workers?: number;
+  prefetch_factor?: number;
+  persistent_workers?: boolean;
+  pin_memory?: boolean;
+  enable_windows_num_workers?: boolean;
   resolution: number[];
   controls: string[];
   control_path?: string | null;
@@ -119,6 +148,9 @@ export interface TrainConfig {
   bypass_guidance_embedding?: boolean;
   steps: number;
   gradient_accumulation: number;
+  train_by_epoch?: boolean;
+  epochs?: number;
+  global_bucket_batching?: boolean;
   train_unet: boolean;
   train_text_encoder: boolean;
   gradient_checkpointing: boolean;
@@ -127,6 +159,7 @@ export interface TrainConfig {
   content_or_style: string;
   optimizer: string;
   lr: number;
+  adapter_lr?: number;
   ema_config?: EMAConfig;
   dtype: string;
   unload_text_encoder: boolean;
@@ -162,8 +195,10 @@ export interface ModelConfig {
   quantize_kwargs?: QuantizeKwargsConfig;
   arch: string;
   low_vram: boolean;
+  auto_low_vram?: boolean;
   model_kwargs: { [key: string]: any };
   layer_offloading?: boolean;
+  auto_layer_offloading_percent?: boolean;
   layer_offloading_transformer_percent?: number;
   layer_offloading_text_encoder_percent?: number;
   assistant_lora_path?: string;
@@ -222,9 +257,13 @@ export interface ProcessConfig {
   sqlite_db_path?: string;
   training_folder: string;
   performance_log_every: number;
+  cleanup_caches_on_startup?: boolean;
+  ui_step_update_interval?: number;
+  ui_stop_poll_interval?: number;
   trigger_word: string | null;
   device: string;
   network?: NetworkConfig;
+  adapter?: AdapterConfig;
   slider?: SliderConfig;
   save: SaveConfig;
   datasets: DatasetConfig[];

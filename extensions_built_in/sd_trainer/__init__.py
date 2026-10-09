@@ -26,16 +26,18 @@ class UITrainerExtension(Extension):
     uid = "ui_trainer"
 
     # name is the name of the extension for printing
-    name = "UI Trainer"
+    name = "UI Trainer (alias of Diffusion Trainer)"
 
     # This is where your process class is loaded
     # keep your imports in here so they don't slow down the rest of the program
     @classmethod
     def get_process(cls):
         # import your process class here so it is only loaded when needed and return it
-        from .UITrainer import UITrainer
+        # ui_trainer is a back-compat alias; DiffusionTrainer auto-detects UI mode
+        # (AITK_JOB_ID + sqlite_db_path present), so old "ui_trainer" configs work.
+        from .DiffusionTrainer import DiffusionTrainer
 
-        return UITrainer
+        return DiffusionTrainer
 
 
 # This is a universal trainer that can be from ui or api

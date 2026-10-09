@@ -8,10 +8,69 @@ from PIL.ImageOps import exif_transpose
 
 from toolkit import image_utils
 from toolkit.basic import get_quick_signature_string
+
+
+# EXIF orientation values 5-8 mean the stored image is rotated 90/270 degrees,
+# so the DISPLAYED width/height are swapped relative to the stored ones.
+_EXIF_ORIENTATION_TAG = 0x0112
+_EXIF_SWAPPED_ORIENTATIONS = (5, 6, 7, 8)
+
+
+# Reading the EXIF orientation is normally cheap (it lives in the header), but for
+# a few formats PIL must scan PAST the pixel data to find it, forcing a full decode.
+# Those are listed here and SKIPPED; everything else -- including any format added
+# in future -- gets its EXIF read, so the default is correctness, not speed.
+#
+# Measured on a real 116k-image PNG dataset:
+#     image_utils.get_image_size (header parse)   0.037 ms/img
+#     Image.open().size                           3.9   ms/img
+#     Image.open().size + getexif()              58.9   ms/img   <- the old default
+# i.e. ~2.3 hours instead of seconds, to look for a tag that 0 of 60 sampled PNGs
+# actually set. PNG orientation is legal (eXIf chunk) but vanishingly rare.
+#
+# If a future format turns out to be slow here too, add its extension below; the
+# only cost of NOT listing one is time, never correctness.
+_EXIF_DECODE_REQUIRED_FORMATS = (".png",)
+
+
+def get_image_size_exif_aware(path):
+    """(width, height) as displayed, without decoding the pixels.
+
+    The old default path did `exif_transpose(Image.open(path))` purely to read
+    .size -- exif_transpose applies the rotation, which fully decodes the image.
+
+    Here the dimensions come from a pure header parse, and the EXIF orientation
+    is applied on top for every format except those where reading it would cost
+    a decode. Orientations 5-8 mean the stored image is rotated a quarter turn,
+    so the displayed dimensions are swapped -- reproducing exif_transpose's
+    .size exactly, which is the only thing this path ever used it for.
+
+    Strictly more correct than the pre-existing `fast_image_size` shortcut,
+    which skipped EXIF for EVERY format and so returned sideways dimensions for
+    rotated JPEGs.
+    """
+    try:
+        w, h = image_utils.get_image_size(path)
+    except Exception:
+        with Image.open(path) as img:
+            w, h = img.size
+
+    if os.path.splitext(path)[1].lower() not in _EXIF_DECODE_REQUIRED_FORMATS:
+        try:
+            with Image.open(path) as img:
+                exif = img.getexif()
+                orientation = exif.get(_EXIF_ORIENTATION_TAG) if exif else None
+            if orientation in _EXIF_SWAPPED_ORIENTATIONS:
+                return h, w
+        except Exception:
+            pass
+    return w, h
 from toolkit.dataloader_mixins import (
     CaptionProcessingDTOMixin,
     ImageProcessingDTOMixin,
     LatentCachingFileItemDTOMixin,
+    hydrate_file_items_from_cached_latents,
+    hydrate_file_items_from_cached_text_embeddings,
     ControlFileItemDTOMixin,
     ArgBreakMixin,
     PoiFileItemDTOMixin,
@@ -69,22 +128,51 @@ class FileItemDTO(
         else:
             file_key = os.path.basename(self.path)
 
-        file_signature = get_quick_signature_string(self.path)
-        if file_signature is None:
-            raise Exception("Error: Could not get file signature for {self.path}")
+        signature_map = kwargs.get("signature_map", None)
+        if signature_map is not None and self.path in signature_map:
+            file_signature = signature_map[self.path]
+        elif self.dataset_config.caches_only and not os.path.exists(self.path):
+            # missing source file; resolved from the size database + disk caches
+            file_signature = None
+        else:
+            file_signature = get_quick_signature_string(self.path)
 
-        use_db_entry = False
-        if file_key in size_database:
-            db_entry = size_database[file_key]
-            if (
-                db_entry is not None
-                and len(db_entry) >= 3
-                and db_entry[2] == file_signature
-            ):
-                use_db_entry = True
+        # ingredients needed to resolve disk caches when the source file and/or
+        # caption sidecar no longer exist (caches_only mode). Plain values only;
+        # FileItemDTOs get deepcopied per fetch, so never hold the db reference.
+        self.cached_src_stat = None
+        self.cached_caption_text = None
+
+        db_entry = size_database.get(file_key)
+        if not isinstance(db_entry, (list, tuple)) or len(db_entry) < 3:
+            db_entry = None
+
+        if file_signature is None:
+            # source file is gone
+            if not self.dataset_config.caches_only:
+                raise Exception(f"Error: Could not get file signature for {self.path}")
+            if db_entry is None:
+                raise Exception(
+                    f"Error: {self.path} is missing and has no size-database entry; "
+                    f"cannot train it from caches"
+                )
+            # trust the size database from the last run the file existed
+            w, h = db_entry[0], db_entry[1]
+            if len(db_entry) >= 5 and db_entry[3] is not None and db_entry[4] is not None:
+                self.cached_src_stat = (int(db_entry[3]), int(db_entry[4]))
+            if len(db_entry) >= 6 and db_entry[5] is not None:
+                self.cached_caption_text = db_entry[5]
+            self.width: int = w
+            self.height: int = h
+            self.dataloader_transforms = kwargs.get("dataloader_transforms", None)
+            super().__init__(*args, **kwargs)
+            self._post_size_init(**kwargs)
+            return
+
+        use_db_entry = db_entry is not None and db_entry[2] == file_signature
 
         if use_db_entry:
-            w, h, _ = size_database[file_key]
+            w, h = db_entry[0], db_entry[1]
         elif self.is_video:
             # Open the video file
             video = cv2.VideoCapture(self.path)
@@ -100,7 +188,6 @@ class FileItemDTO(
 
             # Release the video capture object immediately
             video.release()
-            size_database[file_key] = (width, height, file_signature)
         else:
             if self.dataset_config.fast_image_size:
                 # original method is significantly faster, but some images are read sideways. Not sure why. Do slow method by default.
@@ -114,14 +201,75 @@ class FileItemDTO(
                     img = exif_transpose(Image.open(self.path))
                     w, h = img.size
             else:
-                img = exif_transpose(Image.open(self.path))
-                w, h = img.size
-            size_database[file_key] = (w, h, file_signature)
+                # header-only + EXIF orientation. Identical dimensions to the old
+                # exif_transpose(Image.open(...)) path, without the full decode.
+                try:
+                    w, h = get_image_size_exif_aware(self.path)
+                except Exception:
+                    # anything PIL cannot parse lazily falls back to the old path
+                    img = exif_transpose(Image.open(self.path))
+                    w, h = img.size
+
+        # persist the ingredients of the latent/text-embedding cache keys next to
+        # the dimensions so a later caches_only run can resolve the caches after
+        # the source images / caption files are deleted.
+        src_size = None
+        src_mtime_ns = None
+        stat_map = kwargs.get("stat_map", None)
+        if stat_map is not None and self.path in stat_map:
+            src_size, src_mtime_ns = stat_map[self.path]
+        else:
+            try:
+                _stat = os.stat(self.path)
+                src_size, src_mtime_ns = _stat.st_size, _stat.st_mtime_ns
+            except OSError:
+                pass
+        if src_size is not None:
+            self.cached_src_stat = (src_size, src_mtime_ns)
+
+        caption_text = None
+        caption_signature = None
+        self._caption_from_cache = False
+        if self.dataset_config.caches_only or self.dataset_config.cache_text_embeddings:
+            caption_path = os.path.splitext(self.path)[0] + self.dataset_config.caption_ext
+            # The startup directory scan already holds every sidecar's size and mtime
+            # (ns). If the caption is byte-for-byte the file we stored last time, reuse
+            # the stored text instead of opening it: reading 65k small caption files one
+            # by one was the whole of a 5+ minute "Preprocessing image dimensions" step
+            # on a slow disk, every single job start.
+            if stat_map is not None and caption_path in stat_map:
+                _c_size, _c_mtime_ns = stat_map[caption_path]
+                caption_signature = f"{_c_size}:{_c_mtime_ns}"
+            if (caption_signature is not None and db_entry is not None and len(db_entry) >= 7
+                    and db_entry[6] == caption_signature and db_entry[5] is not None):
+                caption_text = db_entry[5]
+                self._caption_from_cache = True
+            else:
+                try:
+                    if os.path.exists(caption_path):
+                        with open(caption_path, "r", encoding="utf-8") as f:
+                            caption_text = f.read()
+                except OSError:
+                    pass
+                if caption_text is None:
+                    caption_signature = None
+                    if db_entry is not None and len(db_entry) >= 6:
+                        # keep the previously persisted caption if the sidecar is gone
+                        caption_text = db_entry[5]
+        elif db_entry is not None and len(db_entry) >= 6:
+            caption_text = db_entry[5]
+            if len(db_entry) >= 7:
+                caption_signature = db_entry[6]
+        self.cached_caption_text = caption_text
+
+        size_database[file_key] = (w, h, file_signature, src_size, src_mtime_ns, caption_text, caption_signature)
         self.width: int = w
         self.height: int = h
         self.dataloader_transforms = kwargs.get("dataloader_transforms", None)
         super().__init__(*args, **kwargs)
+        self._post_size_init(**kwargs)
 
+    def _post_size_init(self, **kwargs):
         # self.caption_path: str = kwargs.get('caption_path', None)
         self.raw_caption: str = kwargs.get("raw_caption", None)
         # we scale first, then crop
@@ -165,7 +313,6 @@ class DataLoaderBatchDTO:
     def __init__(self, **kwargs):
         try:
             self.file_items: List["FileItemDTO"] = kwargs.get("file_items", None)
-            is_latents_cached = self.file_items[0].is_latent_cached
             self.tensor: Union[torch.Tensor, None] = None
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
@@ -192,50 +339,164 @@ class DataLoaderBatchDTO:
             )
             self.audio_tensor: Union[torch.Tensor, None] = None
             self.first_frame_latents: Union[torch.Tensor, None] = None
+            self.first_frame_conditions: Union[torch.Tensor, None] = None
             self.audio_latents: Union[torch.Tensor, None] = None
 
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
             self.audio_pred: Union[torch.Tensor, None] = None
+            self.latent_cache_mask: Union[torch.Tensor, None] = None
+            self.cached_latent_indices: List[int] = []
+            self.missing_latent_indices: List[int] = []
+            self.text_embedding_cache_mask: Union[torch.Tensor, None] = None
+            self.cached_text_embedding_indices: List[int] = []
+            self.missing_text_embedding_indices: List[int] = []
 
-            if not is_latents_cached:
-                # only return a tensor if latents are not cached
-                self.tensor: torch.Tensor = torch.cat(
-                    [x.tensor.unsqueeze(0) for x in self.file_items]
-                )
+            cached_mask = [x.is_latent_cached for x in self.file_items]
+            has_cached_latents = any(cached_mask)
+            has_uncached_latents = any([not value for value in cached_mask])
+            is_latents_cached = has_cached_latents
+            if has_cached_latents and has_uncached_latents:
+                self.latent_cache_mask = torch.tensor(cached_mask, dtype=torch.bool)
+                self.cached_latent_indices = [
+                    idx for idx, is_cached in enumerate(cached_mask) if is_cached
+                ]
+                self.missing_latent_indices = [
+                    idx for idx, is_cached in enumerate(cached_mask) if not is_cached
+                ]
+
             # if we have encoded latents, we concatenate them
             self.latents: Union[torch.Tensor, None] = None
+            cached_file_items = []
             if is_latents_cached:
-                # this get_latent call with trigger loading all cached items from the disk
-                self.latents = torch.cat(
-                    [x.get_latent().unsqueeze(0) for x in self.file_items]
+                cached_file_items = (
+                    [self.file_items[idx] for idx in self.cached_latent_indices]
+                    if self.latent_cache_mask is not None
+                    else self.file_items
                 )
-                if any(
-                    [x._cached_first_frame_latent is not None for x in self.file_items]
+                hydrate_file_items_from_cached_latents(cached_file_items)
+                missing_latent = next(
+                    (x.path for x in cached_file_items if x._encoded_latent is None),
+                    None,
+                )
+                if missing_latent is not None:
+                    raise Exception(f"Could not load cached latent for {missing_latent}")
+
+                self.latents = torch.cat(
+                    [x._encoded_latent.unsqueeze(0) for x in cached_file_items]
+                )
+                if (
+                    len(cached_file_items) > 0
+                    and all(
+                        x._cached_first_frame_latent is not None
+                        for x in cached_file_items
+                    )
                 ):
                     self.first_frame_latents = torch.cat(
                         [
                             x._cached_first_frame_latent.unsqueeze(0)
-                            if x._cached_first_frame_latent is not None
-                            else torch.zeros_like(
-                                self.file_items[0]._cached_first_frame_latent
-                            ).unsqueeze(0)
-                            for x in self.file_items
+                            for x in cached_file_items
                         ]
                     )
-                if any([x._cached_audio_latent is not None for x in self.file_items]):
+                if (
+                    len(cached_file_items) > 0
+                    and all(
+                        x._cached_first_frame_condition is not None
+                        for x in cached_file_items
+                    )
+                ):
+                    self.first_frame_conditions = torch.cat(
+                        [
+                            x._cached_first_frame_condition.unsqueeze(0)
+                            for x in cached_file_items
+                        ]
+                    )
+                if any([x._cached_audio_latent is not None for x in cached_file_items]):
                     self.audio_latents = torch.cat(
                         [
                             x._cached_audio_latent.unsqueeze(0)
                             if x._cached_audio_latent is not None
                             else torch.zeros_like(
-                                self.file_items[0]._cached_audio_latent
+                                cached_file_items[0]._cached_audio_latent
                             ).unsqueeze(0)
-                            for x in self.file_items
+                            for x in cached_file_items
                         ]
                     )
 
+            latent_space_version = getattr(self.file_items[0], "latent_space_version", "")
+            needs_i2v_tensor_fallback = (
+                self.file_items[0].dataset_config.num_frames > 1
+                and self.file_items[0].dataset_config.do_i2v
+                and (
+                    (
+                        latent_space_version == "wan22_14b_i2v"
+                        and self.first_frame_conditions is None
+                    )
+                    or (
+                        latent_space_version in {"wan22_5b", "ltx2", "ltx2.3"}
+                        and self.first_frame_latents is None
+                    )
+                )
+            )
+
+            if (
+                not is_latents_cached
+                or self.latent_cache_mask is not None
+                or needs_i2v_tensor_fallback
+            ):
+                if self.latent_cache_mask is not None:
+                    for file_item in self.file_items:
+                        if file_item.tensor is None:
+                            file_item.load_and_process_image(
+                                file_item.dataloader_transforms,
+                                prefer_cached_latent=False,
+                            )
+                elif needs_i2v_tensor_fallback:
+                    for file_item in self.file_items:
+                        if file_item.tensor is None:
+                            file_item.load_and_process_image(
+                                file_item.dataloader_transforms,
+                                prefer_cached_latent=False,
+                            )
+                self.tensor = torch.cat(
+                    [x.tensor.unsqueeze(0) for x in self.file_items]
+                )
+
             self.prompt_embeds: Union[PromptEmbeds, None] = None
+            cached_text_embedding_mask = [x.is_text_embedding_cached for x in self.file_items]
+            has_cached_text_embeddings = any(cached_text_embedding_mask)
+            has_uncached_text_embeddings = any([not value for value in cached_text_embedding_mask])
+            if has_cached_text_embeddings and has_uncached_text_embeddings:
+                self.text_embedding_cache_mask = torch.tensor(cached_text_embedding_mask, dtype=torch.bool)
+                self.cached_text_embedding_indices = [
+                    idx for idx, is_cached in enumerate(cached_text_embedding_mask) if is_cached
+                ]
+                self.missing_text_embedding_indices = [
+                    idx for idx, is_cached in enumerate(cached_text_embedding_mask) if not is_cached
+                ]
+            elif has_cached_text_embeddings:
+                self.cached_text_embedding_indices = list(range(len(self.file_items)))
+
+            if has_cached_text_embeddings:
+                cached_file_items = (
+                    [self.file_items[idx] for idx in self.cached_text_embedding_indices]
+                    if self.text_embedding_cache_mask is not None
+                    else self.file_items
+                )
+                hydrate_file_items_from_cached_text_embeddings(cached_file_items)
+                missing_prompt_embed = next(
+                    (x.path for x in cached_file_items if x.prompt_embeds is None),
+                    None,
+                )
+                if missing_prompt_embed is not None:
+                    raise Exception(f"Could not load cached text embedding for {missing_prompt_embed}")
+
+                padding_side = self.file_items[0].te_padding_side
+                self.prompt_embeds = concat_prompt_embeds(
+                    [x.prompt_embeds for x in cached_file_items],
+                    padding_side=padding_side,
+                )
+
             # if self.file_items[0].control_tensor is not None:
             # if any have a control tensor, we concatenate them
             if any([x.control_tensor is not None for x in self.file_items]):
@@ -384,7 +645,7 @@ class DataLoaderBatchDTO:
                             "clip_image_embeds_unconditional is None for some file items"
                         )
 
-            if any([x.prompt_embeds is not None for x in self.file_items]):
+            if self.prompt_embeds is None and any([x.prompt_embeds is not None for x in self.file_items]):
                 # find one to use as a base
                 base_prompt_embeds = None
                 for x in self.file_items:
@@ -397,7 +658,7 @@ class DataLoaderBatchDTO:
                         y = base_prompt_embeds
                     else:
                         y = x.prompt_embeds
-                    if x.text_embedding_space_version == "zimage":
+                    if x.text_embedding_space_version.startswith("zimage"):
                         # z image needs to be a list if it is not already
                         if not isinstance(y.text_embeds, list):
                             y.text_embeds = [y.text_embeds]
@@ -441,6 +702,45 @@ class DataLoaderBatchDTO:
     ):
         return [x.caption_short for x in self.file_items]
 
+    def pin_memory(self):
+        def _pin(value):
+            if value is None:
+                return None
+            if hasattr(value, "pin_memory"):
+                return value.pin_memory()
+            if isinstance(value, list):
+                return [_pin(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_pin(item) for item in value)
+            if isinstance(value, dict):
+                return {key: _pin(item) for key, item in value.items()}
+            return value
+
+        self.tensor = _pin(self.tensor)
+        self.latents = _pin(self.latents)
+        self.control_tensor = _pin(self.control_tensor)
+        self.control_tensor_list = _pin(self.control_tensor_list)
+        self.clip_image_tensor = _pin(self.clip_image_tensor)
+        self.mask_tensor = _pin(self.mask_tensor)
+        self.unaugmented_tensor = _pin(self.unaugmented_tensor)
+        self.unconditional_tensor = _pin(self.unconditional_tensor)
+        self.unconditional_latents = _pin(self.unconditional_latents)
+        self.sigmas = _pin(self.sigmas)
+        self.extra_values = _pin(self.extra_values)
+        self.audio_tensor = _pin(self.audio_tensor)
+        self.first_frame_latents = _pin(self.first_frame_latents)
+        self.first_frame_conditions = _pin(self.first_frame_conditions)
+        self.audio_latents = _pin(self.audio_latents)
+        self.audio_target = _pin(self.audio_target)
+        self.audio_pred = _pin(self.audio_pred)
+        self.latent_cache_mask = _pin(self.latent_cache_mask)
+        self.text_embedding_cache_mask = _pin(self.text_embedding_cache_mask)
+        self.inpaint_tensor = _pin(self.inpaint_tensor)
+        self.clip_image_embeds = _pin(self.clip_image_embeds)
+        self.clip_image_embeds_unconditional = _pin(self.clip_image_embeds_unconditional)
+        self.prompt_embeds = _pin(self.prompt_embeds)
+        return self
+
     def cleanup(self):
         del self.latents
         del self.tensor
@@ -450,6 +750,7 @@ class DataLoaderBatchDTO:
         del self.audio_target
         del self.audio_pred
         del self.first_frame_latents
+        del self.first_frame_conditions
         del self.audio_latents
         for file_item in self.file_items:
             file_item.cleanup()

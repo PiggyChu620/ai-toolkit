@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 from typing import Optional, TYPE_CHECKING, List, Union, Tuple
 
 import torch
@@ -47,6 +48,20 @@ class PromptEmbeds:
                 self.attention_mask = [t.to(*args, **kwargs) for t in self.attention_mask]
             else:
                 self.attention_mask = self.attention_mask.to(*args, **kwargs)
+        return self
+
+    def pin_memory(self):
+        if isinstance(self.text_embeds, list) or isinstance(self.text_embeds, tuple):
+            self.text_embeds = [t.pin_memory() for t in self.text_embeds]
+        else:
+            self.text_embeds = self.text_embeds.pin_memory()
+        if self.pooled_embeds is not None:
+            self.pooled_embeds = self.pooled_embeds.pin_memory()
+        if self.attention_mask is not None:
+            if isinstance(self.attention_mask, list) or isinstance(self.attention_mask, tuple):
+                self.attention_mask = [t.pin_memory() for t in self.attention_mask]
+            else:
+                self.attention_mask = self.attention_mask.pin_memory()
         return self
 
     def detach(self):
@@ -119,24 +134,33 @@ class PromptEmbeds:
         Save the prompt embeds to a file.
         :param path: The path to save the prompt embeds.
         """
+        state_dict = self.to_state_dict()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_file(state_dict, path)
+
+    def to_state_dict(self, prefix: str = "") -> OrderedDict:
         pe = self.clone()
-        state_dict = {}
+        state_dict = OrderedDict()
+
+        def _key(name: str) -> str:
+            return f"{prefix}{name}"
+
         if isinstance(pe.text_embeds, list) or isinstance(pe.text_embeds, tuple):
             for i, text_embed in enumerate(pe.text_embeds):
-                state_dict[f"text_embed_{i}"] = text_embed.cpu()
+                state_dict[_key(f"text_embed_{i}")] = text_embed.cpu()
         else:
-            state_dict["text_embed"] = pe.text_embeds.cpu()
-            
+            state_dict[_key("text_embed")] = pe.text_embeds.cpu()
+
         if pe.pooled_embeds is not None:
-            state_dict["pooled_embed"] = pe.pooled_embeds.cpu()
+            state_dict[_key("pooled_embed")] = pe.pooled_embeds.cpu()
         if pe.attention_mask is not None:
             if isinstance(pe.attention_mask, list) or isinstance(pe.attention_mask, tuple):
                 for i, attn in enumerate(pe.attention_mask):
-                    state_dict[f"attention_mask_{i}"] = attn.cpu()
+                    state_dict[_key(f"attention_mask_{i}")] = attn.cpu()
             else:
-                state_dict["attention_mask"] = pe.attention_mask.cpu()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        save_file(state_dict, path)
+                state_dict[_key("attention_mask")] = pe.attention_mask.cpu()
+
+        return state_dict
     
     @classmethod
     def load(cls, path: str) -> 'PromptEmbeds':
@@ -146,10 +170,22 @@ class PromptEmbeds:
         :return: An instance of PromptEmbeds.
         """
         state_dict = load_file(path, device='cpu')
+        return cls.from_state_dict(state_dict)
+
+    @classmethod
+    def from_state_dict(cls, state_dict, prefix: str = "") -> 'PromptEmbeds':
+        if prefix != "":
+            filtered_state_dict = OrderedDict()
+            for key, value in state_dict.items():
+                if key.startswith(prefix):
+                    filtered_state_dict[key[len(prefix):]] = value
+            state_dict = filtered_state_dict
+
         text_embeds = []
         pooled_embeds = None
         attention_mask = []
         is_list = False
+
         for key in sorted(state_dict.keys()):
             if key.startswith("text_embed_"):
                 is_list = True
@@ -162,6 +198,10 @@ class PromptEmbeds:
                 attention_mask.append(state_dict[key])
             elif key == "attention_mask":
                 attention_mask.append(state_dict[key])
+
+        if len(text_embeds) == 0:
+            raise ValueError("No text embeds found in state dict")
+
         pe = cls(None)
         pe.text_embeds = text_embeds
         if len(text_embeds) == 1 and not is_list:
@@ -245,6 +285,12 @@ class EncodedPromptPair:
 
 
 def concat_prompt_embeds(prompt_embeds: list["PromptEmbeds"], padding_side: str = "right") -> PromptEmbeds:
+    # Let a prompt-embed class implement its own concat (AdvancedPromptEmbeds, used by
+    # krea2 / minimax_h3, is a dict-like bag of named tensors with no .text_embeds or
+    # .pooled_embeds, so the generic path below cannot handle it). Plain PromptEmbeds
+    # defines neither classmethod, so this dispatch never fires for existing models.
+    if hasattr(prompt_embeds[0].__class__, "concat_prompt_embeds"):
+        return prompt_embeds[0].__class__.concat_prompt_embeds(prompt_embeds, padding_side=padding_side)
     # --- pad text_embeds ---
     if isinstance(prompt_embeds[0].text_embeds, (list, tuple)):
         text_embeds = []
@@ -335,17 +381,35 @@ def concat_prompt_pairs(prompt_pairs: list[EncodedPromptPair]):
 
 
 def split_prompt_embeds(concatenated: PromptEmbeds, num_parts=None) -> List[PromptEmbeds]:
+    # See concat_prompt_embeds above -- same dispatch, same reasoning.
+    if hasattr(concatenated.__class__, "split_prompt_embeds"):
+        return concatenated.__class__.split_prompt_embeds(concatenated, num_parts=num_parts)
     if num_parts is None:
         # use batch size
-        num_parts = concatenated.text_embeds.shape[0]
+        if isinstance(concatenated.text_embeds, list) or isinstance(concatenated.text_embeds, tuple):
+            if len(concatenated.text_embeds) > 0 and len(concatenated.text_embeds[0].shape) == 2:
+                num_parts = len(concatenated.text_embeds)
+            else:
+                num_parts = concatenated.text_embeds[0].shape[0]
+        else:
+            num_parts = concatenated.text_embeds.shape[0]
         
     if isinstance(concatenated.text_embeds, list) or isinstance(concatenated.text_embeds, tuple):
-        # split each part
-        text_embeds_splits = [
-            torch.chunk(text, num_parts, dim=0)
-            for text in concatenated.text_embeds
-        ]
-        text_embeds_splits = list(zip(*text_embeds_splits))
+        if len(concatenated.text_embeds) > 0 and len(concatenated.text_embeds[0].shape) == 2:
+            # Some models, such as Z-Image, represent a batch as a list of
+            # per-prompt 2D tensors instead of a single 3D batch tensor.
+            if len(concatenated.text_embeds) != num_parts:
+                raise ValueError(
+                    f"Cannot split list-backed prompt embeds with {len(concatenated.text_embeds)} items into {num_parts} parts"
+                )
+            text_embeds_splits = [[text] for text in concatenated.text_embeds]
+        else:
+            # split each encoder/batched part
+            text_embeds_splits = [
+                torch.chunk(text, num_parts, dim=0)
+                for text in concatenated.text_embeds
+            ]
+            text_embeds_splits = list(zip(*text_embeds_splits))
     else:
         text_embeds_splits = torch.chunk(concatenated.text_embeds, num_parts, dim=0)
 
@@ -399,7 +463,8 @@ def split_prompt_pairs(concatenated: EncodedPromptPair, num_embeds=None) -> List
 
 
 class PromptEmbedsCache:
-    prompts: dict[str, PromptEmbeds] = {}
+    def __init__(self):
+        self.prompts: dict[str, PromptEmbeds] = {}
 
     def __setitem__(self, __name: str, __value: PromptEmbeds) -> None:
         self.prompts[__name] = __value
@@ -409,6 +474,9 @@ class PromptEmbedsCache:
             return self.prompts[__name]
         else:
             return None
+
+    def clear(self) -> None:
+        self.prompts.clear()
 
 
 class EncodedAnchor:

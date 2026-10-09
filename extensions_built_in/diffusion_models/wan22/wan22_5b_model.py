@@ -14,7 +14,10 @@ from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
 from torchvision.transforms import functional as TF
 
 from toolkit.models.wan21.wan21 import Wan21, AggressiveWanUnloadPipeline
-from toolkit.models.wan21.wan_utils import add_first_frame_conditioning_v22
+from toolkit.models.wan21.wan_utils import (
+    add_first_frame_conditioning_v22,
+    add_first_frame_conditioning_v22_from_encoded_latent,
+)
 
 
 # for generation only?
@@ -84,6 +87,9 @@ class Wan225bModel(Wan21):
     arch = "wan22_5b"
     _wan_generation_scheduler_config = scheduler_configUniPC
     _wan_expand_timesteps = True
+
+    def uses_i2v_first_frame_latents(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -246,12 +252,29 @@ class Wan225bModel(Wan21):
         
         if batch.dataset_config.do_i2v:
             with torch.no_grad():
-                frames = batch.tensor
-                if len(frames.shape) == 4:
-                    first_frames = frames
-                elif len(frames.shape) == 5:
-                    first_frames = frames[:, 0]
-                    # Add conditioning using the standalone function
+                if batch.first_frame_latents is not None:
+                    conditioned_latent, noise_mask = (
+                        add_first_frame_conditioning_v22_from_encoded_latent(
+                            latent_model_input=latent_model_input.to(
+                                self.device_torch, self.torch_dtype
+                            ),
+                            encoded_first_frame=batch.first_frame_latents.to(
+                                self.device_torch, self.torch_dtype
+                            ),
+                        )
+                    )
+                else:
+                    frames = batch.tensor
+                    if frames is None:
+                        raise ValueError(
+                            "Wan 2.2 5B I2V requires either cached first-frame latents or source frames."
+                        )
+                    if len(frames.shape) == 4:
+                        first_frames = frames
+                    elif len(frames.shape) == 5:
+                        first_frames = frames[:, 0]
+                    else:
+                        raise ValueError(f"Unknown frame shape {frames.shape}")
                     conditioned_latent, noise_mask = add_first_frame_conditioning_v22(
                         latent_model_input=latent_model_input.to(
                             self.device_torch, self.torch_dtype
@@ -259,10 +282,6 @@ class Wan225bModel(Wan21):
                         first_frame=first_frames.to(self.device_torch, self.torch_dtype),
                         vae=self.vae,
                     )
-                else:
-                    raise ValueError(f"Unknown frame shape {frames.shape}")
-
-                # make the noise mask
                 if noise_mask is None:
                     noise_mask = torch.ones(
                         conditioned_latent.shape,

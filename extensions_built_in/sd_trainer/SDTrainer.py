@@ -1,7 +1,7 @@
 import os
 import random
 from collections import OrderedDict
-from typing import Union, Literal, List, Optional
+from typing import Union, Literal, List, Optional, TYPE_CHECKING
 
 import numpy as np
 from diffusers import T2IAdapter, AutoencoderTiny, ControlNetModel
@@ -16,14 +16,19 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.config_modules import GenerateImageConfig
 from toolkit.data_loader import get_dataloader_datasets
 from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO, FileItemDTO
+from toolkit.dataloader_mixins import (
+    cache_file_item_text_embeddings_to_disk,
+    encode_prompt_embeds_for_file_items,
+)
 from toolkit.guidance import get_targeted_guidance_loss, get_guidance_loss, GuidanceType
 from toolkit.image_utils import show_tensors, show_latents
 from toolkit.ip_adapter import IPAdapter
 from toolkit.custom_adapter import CustomAdapter
+from toolkit.memory_management import sync_grad_transfers
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
 from toolkit.print import print_acc
-from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds
+from toolkit.prompt_utils import PromptEmbeds, concat_prompt_embeds, split_prompt_embeds
 from toolkit.reference_adapter import ReferenceAdapter
-from toolkit.stable_diffusion_model import StableDiffusion, BlankNetwork
 from toolkit.train_tools import get_torch_dtype, apply_snr_weight, add_all_snr_to_noise_scheduler, \
     apply_learnable_snr_gos, LearnableSNRGamma
 import gc
@@ -40,10 +45,30 @@ from toolkit.unloader import unload_text_encoder
 from PIL import Image
 from torchvision.transforms import functional as TF
 
+if TYPE_CHECKING:
+    from toolkit.stable_diffusion_model import StableDiffusion
+
 
 def flush():
     torch.cuda.empty_cache()
-    gc.collect()
+
+
+class BlankNetwork:
+
+    def __init__(self):
+        self.multiplier = 1.0
+        self.is_active = True
+        self.is_merged_in = False
+        self.can_merge_in = False
+
+    def __enter__(self):
+        self.is_active = True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.is_active = False
+
+    def train(self):
+        pass
 
 
 adapter_transforms = transforms.Compose([
@@ -52,6 +77,9 @@ adapter_transforms = transforms.Compose([
 
 
 class SDTrainer(BaseSDTrainProcess):
+    # hook_train_loop sets self._oom_lora_updated before optimizer.step(), which is what
+    # makes retrying an OOM'd step safe (see BaseSDTrainProcess.supports_oom_retry)
+    supports_oom_retry = True
 
     def __init__(self, process_id: int, job, config: OrderedDict, **kwargs):
         super().__init__(process_id, job, config, **kwargs)
@@ -83,6 +111,7 @@ class SDTrainer(BaseSDTrainProcess):
 
         self.cached_blank_embeds: Optional[PromptEmbeds] = None
         self.cached_trigger_embeds: Optional[PromptEmbeds] = None
+        self._warned_cached_caption_dropout: bool = False
         self.diff_output_preservation_embeds: Optional[PromptEmbeds] = None
         
         self.dfe: Optional[DiffusionFeatureExtractor] = None
@@ -116,7 +145,335 @@ class SDTrainer(BaseSDTrainProcess):
 
     def before_model_load(self):
         pass
-    
+
+    def _move_to_device(self, value, *, device=None, dtype=None):
+        if value is None:
+            return None
+        if device is None:
+            device = self.device_torch
+
+        to_kwargs = {"non_blocking": True}
+        if dtype is not None:
+            to_kwargs["dtype"] = dtype
+        return value.to(device, **to_kwargs)
+
+    def _should_lazy_cache_text_embeddings(self, batch: DataLoaderBatchDTO) -> bool:
+        dataset_config = batch.dataset_config
+        return bool(
+            dataset_config is not None
+            and getattr(dataset_config, "cache_text_embeddings", False)
+            and getattr(dataset_config, "lazy_cache_text_embeddings", False)
+        )
+
+    def _cache_missing_batch_text_embeddings(
+            self,
+            batch: DataLoaderBatchDTO,
+            prompt_embeds: PromptEmbeds,
+            file_item_indices: List[int],
+    ):
+        if not self._should_lazy_cache_text_embeddings(batch):
+            return
+        if len(file_item_indices) == 0:
+            return
+
+        split_embeds = split_prompt_embeds(prompt_embeds, len(file_item_indices))
+        cache_pairs = []
+        for prompt_idx, file_item_idx in enumerate(file_item_indices):
+            file_item = batch.file_items[file_item_idx]
+            prompt_embed = split_embeds[prompt_idx].detach().to("cpu")
+            file_item.prompt_embeds = prompt_embed.clone()
+            cache_pairs.append((file_item, prompt_embed))
+
+        cache_file_item_text_embeddings_to_disk(
+            cache_pairs,
+            batch.dataset_config.text_embedding_cache_shard_size,
+        )
+
+    def _merge_cached_and_missing_prompt_embeds(
+            self,
+            batch: DataLoaderBatchDTO,
+            cached_prompt_embeds: Optional[PromptEmbeds],
+            missing_prompt_embeds: Optional[PromptEmbeds],
+    ) -> PromptEmbeds:
+        if batch.text_embedding_cache_mask is None:
+            if cached_prompt_embeds is not None:
+                return cached_prompt_embeds
+            if missing_prompt_embeds is not None:
+                return missing_prompt_embeds
+            raise ValueError("No prompt embeds available to merge")
+
+        merged_prompt_embeds: List[Optional[PromptEmbeds]] = [None] * len(batch.file_items)
+
+        if cached_prompt_embeds is not None and len(batch.cached_text_embedding_indices) > 0:
+            cached_split = split_prompt_embeds(
+                cached_prompt_embeds,
+                len(batch.cached_text_embedding_indices),
+            )
+            for idx, prompt_embed in zip(batch.cached_text_embedding_indices, cached_split):
+                merged_prompt_embeds[idx] = prompt_embed
+
+        if missing_prompt_embeds is not None and len(batch.missing_text_embedding_indices) > 0:
+            missing_split = split_prompt_embeds(
+                missing_prompt_embeds,
+                len(batch.missing_text_embedding_indices),
+            )
+            for idx, prompt_embed in zip(batch.missing_text_embedding_indices, missing_split):
+                merged_prompt_embeds[idx] = prompt_embed
+
+        if any([prompt_embed is None for prompt_embed in merged_prompt_embeds]):
+            raise ValueError("Could not merge cached and missing prompt embeds for the full batch")
+
+        return concat_prompt_embeds(
+            [prompt_embed for prompt_embed in merged_prompt_embeds if prompt_embed is not None],
+            padding_side=batch.file_items[0].te_padding_side,
+        )
+
+    @staticmethod
+    def _prompt_embeds_batch_size(prompt_embeds: PromptEmbeds) -> int:
+        text_embeds = prompt_embeds.text_embeds
+        if isinstance(text_embeds, (list, tuple)):
+            if len(text_embeds) == 0:
+                return 0
+            if len(text_embeds[0].shape) == 2:
+                return len(text_embeds)
+            return text_embeds[0].shape[0]
+        return text_embeds.shape[0]
+
+    @staticmethod
+    def _align_embed_seq_len(source: torch.Tensor, target_len: int, padding_side: str):
+        current_len = source.shape[0]
+        if current_len == target_len:
+            return source
+        if current_len > target_len:
+            return None
+        pad = torch.zeros(
+            (target_len - current_len, *source.shape[1:]),
+            dtype=source.dtype,
+            device=source.device,
+        )
+        if padding_side == 'right':
+            return torch.cat([source, pad], dim=0)
+        return torch.cat([pad, source], dim=0)
+
+    def _prompt_embeds_slot_fits(self, dest: PromptEmbeds, source: PromptEmbeds) -> bool:
+        dest_text = dest.text_embeds
+        if isinstance(dest_text, (list, tuple)) and len(dest_text) > 0 and len(dest_text[0].shape) == 2:
+            return True
+        src_text = source.text_embeds
+        src_list = src_text if isinstance(src_text, (list, tuple)) else [src_text]
+        dest_list = dest_text if isinstance(dest_text, (list, tuple)) else [dest_text]
+        if len(src_list) != len(dest_list):
+            return False
+        for src_item, dest_item in zip(src_list, dest_list):
+            if len(src_item.shape) == 3:
+                src_item = src_item[0]
+            if src_item.shape[0] > dest_item.shape[1]:
+                return False
+        return True
+
+    def _write_prompt_embeds_slot(self, dest, idx, source, padding_side='right'):
+        dest_text = dest.text_embeds
+        src_text = source.text_embeds
+
+        if isinstance(dest_text, (list, tuple)) and len(dest_text) > 0 and len(dest_text[0].shape) == 2:
+            if isinstance(dest.text_embeds, tuple):
+                dest.text_embeds = list(dest.text_embeds)
+                dest_text = dest.text_embeds
+            src_item = src_text[0] if isinstance(src_text, (list, tuple)) else src_text
+            if len(src_item.shape) == 3:
+                src_item = src_item[0]
+            dest.text_embeds[idx] = src_item.to(
+                device=dest_text[idx].device, dtype=dest_text[idx].dtype
+            ).clone()
+        elif isinstance(dest_text, (list, tuple)):
+            src_list = src_text if isinstance(src_text, (list, tuple)) else [src_text]
+            for enc_idx, dest_tensor in enumerate(dest_text):
+                src_item = src_list[enc_idx]
+                if len(src_item.shape) == 3:
+                    src_item = src_item[0]
+                dest_tensor[idx] = self._align_embed_seq_len(
+                    src_item.to(device=dest_tensor.device, dtype=dest_tensor.dtype),
+                    dest_tensor.shape[1],
+                    padding_side,
+                )
+        else:
+            src_item = src_text[0] if isinstance(src_text, (list, tuple)) else src_text
+            if len(src_item.shape) == 3:
+                src_item = src_item[0]
+            dest_text[idx] = self._align_embed_seq_len(
+                src_item.to(device=dest_text.device, dtype=dest_text.dtype),
+                dest_text.shape[1],
+                padding_side,
+            )
+
+        if dest.pooled_embeds is not None and source.pooled_embeds is not None:
+            dest.pooled_embeds[idx] = source.pooled_embeds[0].to(
+                device=dest.pooled_embeds.device, dtype=dest.pooled_embeds.dtype
+            )
+
+        if dest.attention_mask is not None and source.attention_mask is not None:
+            dest_masks = dest.attention_mask
+            src_masks = source.attention_mask
+            dest_mask_list = dest_masks if isinstance(dest_masks, (list, tuple)) else [dest_masks]
+            src_mask_list = src_masks if isinstance(src_masks, (list, tuple)) else [src_masks]
+            for mask_idx, dest_mask in enumerate(dest_mask_list):
+                src_mask = src_mask_list[mask_idx]
+                if len(src_mask.shape) == 2:
+                    src_mask = src_mask[0]
+                dest_mask[idx] = self._align_embed_seq_len(
+                    src_mask.to(device=dest_mask.device, dtype=dest_mask.dtype),
+                    dest_mask.shape[1],
+                    padding_side,
+                )
+
+    def _warn_cached_caption_dropout_once(self, message: str):
+        if self._warned_cached_caption_dropout:
+            return
+        self._warned_cached_caption_dropout = True
+        print_acc(message)
+
+    def _apply_cached_caption_dropout_advanced(
+            self, conditional_embeds, blank_embeds, file_items, eligible):
+        """Caption dropout for AdvancedPromptEmbeds (dict of named per-item tensors).
+
+        Every guard runs BEFORE any random.random() call, so a config that can never
+        drop does not perturb the RNG stream (same rule as the PromptEmbeds path).
+        """
+        keys = conditional_embeds.keys()
+        if not keys:
+            return conditional_embeds
+        if not isinstance(blank_embeds, AdvancedPromptEmbeds)                 or set(blank_embeds.keys()) != set(keys):
+            self._warn_cached_caption_dropout_once(
+                "WARNING: caption_dropout_rate is set with cached text embeddings, but the "
+                "blank prompt embedding does not carry the same fields as the batch "
+                "embeddings. Skipping caption dropout."
+            )
+            return conditional_embeds
+        if len(conditional_embeds[keys[0]]) != len(file_items):
+            self._warn_cached_caption_dropout_once(
+                "WARNING: caption_dropout_rate is set with cached text embeddings, but the "
+                "batch prompt embeds are not 1:1 with the batch items. Skipping caption dropout."
+            )
+            return conditional_embeds
+
+        trigger = self.cached_trigger_embeds
+        use_trigger = isinstance(trigger, AdvancedPromptEmbeds)             and set(trigger.keys()) == set(keys)
+
+        drop_indices = [
+            idx for idx in eligible
+            if random.random() < float(file_items[idx].dataset_config.caption_dropout_rate)
+        ]
+        if not drop_indices:
+            return conditional_embeds
+
+        out = conditional_embeds.clone()
+        for idx in drop_indices:
+            source = blank_embeds
+            if use_trigger and not getattr(file_items[idx], 'is_reg', False):
+                source = trigger
+            for key in keys:
+                dest_tensor = out[key][idx]
+                src_tensor = source[key][0]
+                # never dtype-cast frozen (integer/bool) entries such as token tags
+                if dest_tensor.is_floating_point() and src_tensor.is_floating_point():
+                    src_tensor = src_tensor.to(device=dest_tensor.device, dtype=dest_tensor.dtype)
+                else:
+                    src_tensor = src_tensor.to(device=dest_tensor.device)
+                # .clone() is load-bearing: .to() returns SELF when the tensor is
+                # already at the requested device/dtype, and cached_blank_embeds is
+                # built on-device in the train dtype -- so without this every dropped
+                # slot in every batch would alias the one shared blank embedding, and
+                # any future in-place op on a batch embed would silently corrupt it
+                # for the rest of the run. Matches _write_prompt_embeds_slot.
+                out[key][idx] = src_tensor.clone()
+        return out
+
+    def _apply_cached_caption_dropout(self, batch, conditional_embeds):
+        if conditional_embeds is None or batch is None:
+            return conditional_embeds
+        file_items = getattr(batch, 'file_items', None)
+        if not file_items:
+            return conditional_embeds
+
+        eligible = [
+            idx for idx, fi in enumerate(file_items)
+            if getattr(getattr(fi, 'dataset_config', None), 'cache_text_embeddings', False)
+            and float(getattr(fi.dataset_config, 'caption_dropout_rate', 0.0) or 0.0) > 0.0
+        ]
+        if len(eligible) == 0:
+            return conditional_embeds
+
+        text_only_items = getattr(self.sd, 'encodes_text_without_control', False) and all(
+            getattr(file_items[idx], 'control_path', None) is None for idx in eligible
+        )
+        if getattr(self.sd, 'encode_control_in_text_embeddings', False) and not text_only_items:
+            self._warn_cached_caption_dropout_once(
+                "WARNING: caption_dropout_rate is set with cached text embeddings, but this model "
+                "encodes the control image into the text embedding, so there is no single blank "
+                "embedding to substitute. Skipping caption dropout."
+            )
+            return conditional_embeds
+
+        blank_embeds = self.cached_blank_embeds
+        if blank_embeds is None:
+            blank_embeds = self.unconditional_embeds
+        if blank_embeds is None:
+            self._warn_cached_caption_dropout_once(
+                "WARNING: caption_dropout_rate is set with cached text embeddings, but no blank "
+                "prompt embedding is available to substitute. Skipping caption dropout."
+            )
+            return conditional_embeds
+
+        # AdvancedPromptEmbeds (krea2 / minimax_h3) is a dict-like bag of named,
+        # VARIABLE-LENGTH tensors. It has no .pooled_embeds / .attention_mask, so the
+        # guards and slot-writer below would raise on it -- and it needs no padding,
+        # because each item keeps its own natural length. Direct element swap instead.
+        if isinstance(conditional_embeds, AdvancedPromptEmbeds):
+            return self._apply_cached_caption_dropout_advanced(
+                conditional_embeds, blank_embeds, file_items, eligible
+            )
+
+        if self._prompt_embeds_batch_size(conditional_embeds) != len(file_items):
+            self._warn_cached_caption_dropout_once(
+                "WARNING: caption_dropout_rate is set with cached text embeddings, but the batch "
+                "prompt embeds are not 1:1 with the batch items. Skipping caption dropout."
+            )
+            return conditional_embeds
+
+        candidates = [blank_embeds]
+        if self.cached_trigger_embeds is not None:
+            candidates.append(self.cached_trigger_embeds)
+        for candidate in candidates:
+            if (conditional_embeds.pooled_embeds is not None) != (candidate.pooled_embeds is not None) \
+                    or (conditional_embeds.attention_mask is not None) != (candidate.attention_mask is not None) \
+                    or not self._prompt_embeds_slot_fits(conditional_embeds, candidate):
+                self._warn_cached_caption_dropout_once(
+                    "WARNING: caption_dropout_rate is set with cached text embeddings, but the blank "
+                    "prompt embedding is not shaped like the batch embeddings. Skipping caption dropout."
+                )
+                return conditional_embeds
+
+        drop_indices = []
+        for idx in eligible:
+            if random.random() < float(file_items[idx].dataset_config.caption_dropout_rate):
+                drop_indices.append(idx)
+        if len(drop_indices) == 0:
+            return conditional_embeds
+
+        conditional_embeds = conditional_embeds.clone()
+        for idx in drop_indices:
+            file_item = file_items[idx]
+            source_embeds = blank_embeds
+            if self.cached_trigger_embeds is not None and not getattr(file_item, 'is_reg', False):
+                source_embeds = self.cached_trigger_embeds
+            self._write_prompt_embeds_slot(
+                conditional_embeds,
+                idx,
+                source_embeds,
+                getattr(file_item, 'te_padding_side', 'right'),
+            )
+        return conditional_embeds
+
     def cache_sample_prompts(self):
         if self.train_config.disable_sampling:
             return
@@ -242,6 +599,18 @@ class SDTrainer(BaseSDTrainProcess):
             self.taesd.eval()
             self.taesd.requires_grad_(False)
 
+    def encode_static_prompt(self, prompt, **kwargs):
+        """Blank / trigger / unconditional embeds. Models that encode references inside their text
+        embeddings get a black stand-in reference here, as they always have; models that can encode
+        plain text (encodes_text_without_control, e.g. Qwen-Image 2.1) get exactly that, since a
+        stand-in would reserve image slots that no training batch fills."""
+        if self.sd.encode_control_in_text_embeddings and not getattr(self.sd, "encodes_text_without_control", False):
+            control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
+            if self.sd.has_multiple_control_images:
+                control_image = [control_image]
+            kwargs['control_images'] = control_image
+        return self.sd.encode_prompt(prompt, **kwargs)
+
     def hook_before_train_loop(self):
         super().hook_before_train_loop()
         if self.is_caching_text_embeddings:
@@ -250,18 +619,9 @@ class SDTrainer(BaseSDTrainProcess):
         
         # cache unconditional embeds (blank prompt)
         with torch.no_grad():
-            kwargs = {}
-            if self.sd.encode_control_in_text_embeddings:
-                # just do a blank image for unconditionals
-                control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                if self.sd.has_multiple_control_images:
-                    control_image = [control_image]
-                
-                kwargs['control_images'] = control_image
-            self.unconditional_embeds = self.sd.encode_prompt(
+            self.unconditional_embeds = self.encode_static_prompt(
                 [self.train_config.unconditional_prompt],
                 long_prompts=self.do_long_prompts,
-                **kwargs
             ).to(
                 self.device_torch,
                 dtype=self.sd.torch_dtype
@@ -309,30 +669,50 @@ class SDTrainer(BaseSDTrainProcess):
 
         # handle unload text encoder
         if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
-            print_acc("Caching embeddings and unloading text encoder")
+            if self.has_lazy_text_embedding_caching:
+                print_acc("Caching embeddings and CPU-offloading text encoder between lazy cache misses")
+            else:
+                print_acc("Caching embeddings and unloading text encoder")
             with torch.no_grad():
                 if self.train_config.train_text_encoder:
                     raise ValueError("Cannot unload text encoder if training text encoder")
                 # cache embeddings
                 self.sd.text_encoder_to(self.device_torch)
-                encode_kwargs = {}
-                if self.sd.encode_control_in_text_embeddings:
-                    # just do a blank image for unconditionals
-                    control_image = torch.zeros((1, 3, 224, 224), device=self.sd.device_torch, dtype=self.sd.torch_dtype)
-                    if self.sd.has_multiple_control_images:
-                        control_image = [control_image]
-                    encode_kwargs['control_images'] = control_image
-                self.cached_blank_embeds = self.sd.encode_prompt("", **encode_kwargs)
+                self.cached_blank_embeds = self.encode_static_prompt("")
                 if self.trigger_word is not None:
-                    self.cached_trigger_embeds = self.sd.encode_prompt(self.trigger_word, **encode_kwargs)
+                    self.cached_trigger_embeds = self.encode_static_prompt(self.trigger_word)
                 if self.train_config.diff_output_preservation:
                     self.diff_output_preservation_embeds = self.sd.encode_prompt(self.train_config.diff_output_preservation_class)
                 
                 self.cache_sample_prompts()
                 
-                print_acc("\n***** UNLOADING TEXT ENCODER *****")
+                print_acc("\n***** TEXT ENCODER STATE *****")
                 if self.is_caching_text_embeddings:
-                    print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
+                    if self.has_lazy_text_embedding_caching:
+                        print_acc("Lazy text-embedding caching is enabled. The real text encoder will stay on CPU and move to GPU only for cache misses.")
+                        # Qualify that claim when a MemoryManager is attached: the
+                        # managed Linears never move as a unit -- they stream per
+                        # forward -- while the unmanaged modules (embedding table,
+                        # norms) are what text_encoder_to() actually moves.
+                        _te_mm = getattr(self.sd.text_encoder, '_memory_manager', None)
+                        if _te_mm is not None:
+                            _resident = sum(
+                                p.numel() * p.element_size()
+                                for m in _te_mm.unmanaged_modules
+                                for p in (
+                                    [m] if isinstance(m, torch.nn.Parameter)
+                                    else list(m.parameters(recurse=False)) + list(m.buffers(recurse=False))
+                                )
+                                if p.device.type != 'cpu'
+                            )
+                            print_acc(
+                                f"  NOTE: layer offloading is attached to the text encoder: its Linear layers "
+                                f"stream to {self.device_torch} per forward, and its "
+                                f"{_resident / (1024 ** 3):.2f} GiB of unmanaged modules (token embedding, "
+                                f"norms) move to {self.device_torch} for each cache-miss encode and back to CPU after."
+                            )
+                    else:
+                        print_acc("Embeddings cached to disk. We dont need the text encoder anymore")
                 else:
                     print_acc("This will train only with a blank prompt or trigger word, if set")
                     print_acc("If this is not what you want, remove the unload_text_encoder flag")
@@ -340,7 +720,7 @@ class SDTrainer(BaseSDTrainProcess):
                 print_acc("")
 
                 # unload the text encoder
-                if self.is_caching_text_embeddings:
+                if self.can_replace_text_encoder_after_caching:
                     unload_text_encoder(self.sd)
                 else:
                     # todo once every model is tested to work, unload properly. Though, this will all be merged into one thing.
@@ -535,7 +915,7 @@ class SDTrainer(BaseSDTrainProcess):
             if self.train_config.inverted_mask_prior and prior_pred is not None and has_mask:
                 assert not self.train_config.train_turbo
                 with torch.no_grad():
-                    prior_mask = batch.mask_tensor.to(self.device_torch, dtype=dtype)
+                    prior_mask = self._move_to_device(batch.mask_tensor, dtype=dtype)
                     if len(noise_pred.shape) == 5:
                         # video B,C,T,H,W
                         lat_height = batch.latents.shape[3]
@@ -750,7 +1130,10 @@ class SDTrainer(BaseSDTrainProcess):
                 # we have to encode images into latents for now
                 # we also denoise as the unaugmented tensor is not a noisy diffirental
                 with torch.no_grad():
-                    unaugmented_latents = self.sd.encode_images(batch.unaugmented_tensor).to(self.device_torch, dtype=dtype)
+                    unaugmented_latents = self._move_to_device(
+                        self.sd.encode_images(batch.unaugmented_tensor),
+                        dtype=dtype,
+                    )
                     unaugmented_latents = unaugmented_latents * self.train_config.latent_multiplier
                     target = unaugmented_latents.detach()
 
@@ -1078,7 +1461,7 @@ class SDTrainer(BaseSDTrainProcess):
             was_adapter_active = self.adapter.is_active
             self.adapter.is_active = False
 
-        if self.train_config.unload_text_encoder and self.adapter is not None and not isinstance(self.adapter, CustomAdapter):
+        if self.unload_text_encoder_for_training and self.adapter is not None and not isinstance(self.adapter, CustomAdapter):
             raise ValueError("Prior predictions currently do not support unloading text encoder with adapter")
         # do a prediction here so we can match its output with network multiplier set to 0.0
         with torch.no_grad():
@@ -1115,11 +1498,15 @@ class SDTrainer(BaseSDTrainProcess):
                     prompt_list[idx] = prompt
 
                 if batch.prompt_embeds is not None:
-                    embeds_to_use = batch.prompt_embeds.clone().to(self.device_torch, dtype=dtype)
+                    embeds_to_use = self._move_to_device(batch.prompt_embeds.clone(), dtype=dtype)
                 else:
                     prompt_kwargs = {}
                     if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        prompt_kwargs['control_images'] = self._move_to_device(
+                            batch.control_tensor,
+                            device=self.sd.device_torch,
+                            dtype=self.sd.torch_dtype,
+                        )
                     embeds_to_use = self.sd.encode_prompt(
                         prompt_list,
                         long_prompts=self.do_long_prompts).to(
@@ -1142,15 +1529,15 @@ class SDTrainer(BaseSDTrainProcess):
                     unconditional_embeds.text_embeds = unconditional_embeds.text_embeds[:, :end_pos]
 
             if unconditional_embeds is not None:
-                unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=dtype).detach()
+                unconditional_embeds = self._move_to_device(unconditional_embeds, dtype=dtype).detach()
             
             guidance_embedding_scale = self.train_config.cfg_scale
             if self.train_config.do_guidance_loss:
                 guidance_embedding_scale = self._guidance_loss_target_batch
 
             prior_pred = self.sd.predict_noise(
-                latents=noisy_latents.to(self.device_torch, dtype=dtype).detach(),
-                conditional_embeddings=embeds_to_use.to(self.device_torch, dtype=dtype).detach(),
+                latents=self._move_to_device(noisy_latents, dtype=dtype).detach(),
+                conditional_embeddings=self._move_to_device(embeds_to_use, dtype=dtype).detach(),
                 unconditional_embeddings=unconditional_embeds,
                 timestep=timesteps,
                 guidance_scale=self.train_config.cfg_scale,
@@ -1202,9 +1589,9 @@ class SDTrainer(BaseSDTrainProcess):
         if self.train_config.do_guidance_loss:
             guidance_embedding_scale = self._guidance_loss_target_batch
         return self.sd.predict_noise(
-            latents=noisy_latents.to(self.device_torch, dtype=dtype),
-            conditional_embeddings=conditional_embeds.to(self.device_torch, dtype=dtype),
-            unconditional_embeddings=unconditional_embeds,
+            latents=self._move_to_device(noisy_latents, dtype=dtype),
+            conditional_embeddings=self._move_to_device(conditional_embeds, dtype=dtype),
+            unconditional_embeddings=self._move_to_device(unconditional_embeds, dtype=dtype),
             timestep=timesteps,
             guidance_scale=self.train_config.cfg_scale,
             guidance_embedding_scale=guidance_embedding_scale,
@@ -1304,7 +1691,7 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('get_adapter_images'):
                     # todo move this to data loader
                     if batch.control_tensor is not None:
-                        adapter_images = batch.control_tensor.to(self.device_torch, dtype=dtype).detach()
+                        adapter_images = self._move_to_device(batch.control_tensor, dtype=dtype).detach()
                         # match in channels
                         if self.assistant_adapter is not None:
                             in_channels = self.assistant_adapter.config.in_channels
@@ -1319,13 +1706,13 @@ class SDTrainer(BaseSDTrainProcess):
                 with self.timer('get_clip_images'):
                     # todo move this to data loader
                     if batch.clip_image_tensor is not None:
-                        clip_images = batch.clip_image_tensor.to(self.device_torch, dtype=dtype).detach()
+                        clip_images = self._move_to_device(batch.clip_image_tensor, dtype=dtype).detach()
 
             mask_multiplier = torch.ones((noisy_latents.shape[0], 1, 1, 1), device=self.device_torch, dtype=dtype)
             if batch.mask_tensor is not None:
                 with self.timer('get_mask_multiplier'):
                     # upsampling no supported for bfloat16
-                    mask_multiplier = batch.mask_tensor.to(self.device_torch, dtype=torch.float16).detach()
+                    mask_multiplier = self._move_to_device(batch.mask_tensor, dtype=torch.float16).detach()
                     # scale down to the size of the latents, mask multiplier shape(bs, 1, width, height), noisy_latents shape(bs, channels, width, height)
                     if len(noisy_latents.shape) == 5:
                         # video B,C,T,H,W
@@ -1339,7 +1726,7 @@ class SDTrainer(BaseSDTrainProcess):
                     )
                     # expand to match latents
                     mask_multiplier = mask_multiplier.expand(-1, noisy_latents.shape[1], -1, -1)
-                    mask_multiplier = mask_multiplier.to(self.device_torch, dtype=dtype).detach()
+                    mask_multiplier = self._move_to_device(mask_multiplier, dtype=dtype).detach()
                     # make avg 1.0
                     mask_multiplier = mask_multiplier / mask_multiplier.mean()
 
@@ -1472,7 +1859,7 @@ class SDTrainer(BaseSDTrainProcess):
                     with self.timer('encode_clip_vision_embeds'):
                         if has_clip_image:
                             conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
-                                clip_images.detach().to(self.device_torch, dtype=dtype),
+                                clip_images.detach(),
                                 is_training=True,
                                 has_been_preprocessed=True
                             )
@@ -1507,28 +1894,77 @@ class SDTrainer(BaseSDTrainProcess):
                     unconditional_embeds = None
                     prompt_kwargs = {}
                     if self.sd.encode_control_in_text_embeddings and batch.control_tensor is not None:
-                        prompt_kwargs['control_images'] = batch.control_tensor.to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        prompt_kwargs['control_images'] = self._move_to_device(
+                            batch.control_tensor,
+                            device=self.sd.device_torch,
+                            dtype=self.sd.torch_dtype,
+                        )
                     if self.train_config.unload_text_encoder or self.is_caching_text_embeddings:
                         with torch.set_grad_enabled(False):
+                            cached_prompt_embeds = None
                             if batch.prompt_embeds is not None:
-                                # use the cached embeds
-                                conditional_embeds = batch.prompt_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                cached_prompt_embeds = self._move_to_device(
+                                    batch.prompt_embeds.clone().detach(),
+                                    dtype=dtype,
                                 )
+
+                            if (
+                                    self.is_caching_text_embeddings
+                                    and self.has_lazy_text_embedding_caching
+                                    and (
+                                        batch.text_embedding_cache_mask is not None
+                                        or cached_prompt_embeds is None
+                                    )
+                            ):
+                                if batch.text_embedding_cache_mask is not None:
+                                    missing_indices = batch.missing_text_embedding_indices
+                                else:
+                                    missing_indices = list(range(len(batch.file_items)))
+
+                                missing_file_items = [batch.file_items[idx] for idx in missing_indices]
+                                self.sd.text_encoder_to(self.device_torch)
+                                try:
+                                    missing_prompt_embeds = encode_prompt_embeds_for_file_items(
+                                        self.sd,
+                                        missing_file_items,
+                                    ).to(
+                                        self.device_torch,
+                                        dtype=dtype,
+                                    ).detach()
+                                finally:
+                                    if self.unload_text_encoder_for_training:
+                                        self.sd.text_encoder_to("cpu")
+                                        flush()
+                                self._cache_missing_batch_text_embeddings(
+                                    batch,
+                                    missing_prompt_embeds,
+                                    missing_indices,
+                                )
+                                conditional_embeds = self._merge_cached_and_missing_prompt_embeds(
+                                    batch,
+                                    cached_prompt_embeds,
+                                    missing_prompt_embeds,
+                                )
+                            elif cached_prompt_embeds is not None:
+                                # use the cached embeds
+                                conditional_embeds = cached_prompt_embeds
                             else:
-                                embeds_to_use = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                embeds_to_use = self._move_to_device(
+                                    self.cached_blank_embeds.clone().detach(),
+                                    dtype=dtype,
                                 )
                                 if self.cached_trigger_embeds is not None and not is_reg:
-                                    embeds_to_use = self.cached_trigger_embeds.clone().detach().to(
-                                        self.device_torch, dtype=dtype
+                                    embeds_to_use = self._move_to_device(
+                                        self.cached_trigger_embeds.clone().detach(),
+                                        dtype=dtype,
                                     )
                                 conditional_embeds = concat_prompt_embeds(
                                     [embeds_to_use] * noisy_latents.shape[0]
                                 )
                             if self.train_config.do_cfg:
-                                unconditional_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                unconditional_embeds = self._move_to_device(
+                                    self.cached_blank_embeds.clone().detach(),
+                                    dtype=dtype,
                                 )
                                 unconditional_embeds = concat_prompt_embeds(
                                     [unconditional_embeds] * noisy_latents.shape[0]
@@ -1615,6 +2051,11 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.train_config.do_cfg:
                             unconditional_embeds = unconditional_embeds.detach()
                     
+                    conditional_embeds = self._apply_cached_caption_dropout(
+                        batch,
+                        conditional_embeds,
+                    )
+
                     if self.decorator:
                         conditional_embeds.text_embeds = self.decorator(
                             conditional_embeds.text_embeds
@@ -1715,7 +2156,7 @@ class SDTrainer(BaseSDTrainProcess):
                                 )
                         elif has_clip_image:
                             conditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
-                                clip_images.detach().to(self.device_torch, dtype=dtype),
+                                clip_images.detach(),
                                 is_training=True,
                                 has_been_preprocessed=True,
                                 quad_count=quad_count,
@@ -1725,7 +2166,7 @@ class SDTrainer(BaseSDTrainProcess):
                             )
                             if self.train_config.do_cfg:
                                 unconditional_clip_embeds = self.adapter.get_clip_image_embeds_from_tensors(
-                                    clip_images.detach().to(self.device_torch, dtype=dtype),
+                                    clip_images.detach(),
                                     is_training=True,
                                     drop=True,
                                     has_been_preprocessed=True,
@@ -1765,7 +2206,7 @@ class SDTrainer(BaseSDTrainProcess):
                     if has_clip_image or has_adapter_img:
                         img_to_use = clip_images if has_clip_image else adapter_images
                         # currently 0-1 needs to be -1 to 1
-                        reference_images = ((img_to_use - 0.5) * 2).detach().to(self.device_torch, dtype=dtype)
+                        reference_images = ((img_to_use - 0.5) * 2).detach()
                         self.adapter.set_reference_images(reference_images)
                         self.adapter.noise_scheduler = self.sd.noise_scheduler
                     elif is_reg:
@@ -1798,8 +2239,9 @@ class SDTrainer(BaseSDTrainProcess):
                             prior_embeds_to_use = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                         
                         if self.train_config.blank_prompt_preservation:
-                            blank_embeds = self.cached_blank_embeds.clone().detach().to(
-                                self.device_torch, dtype=dtype
+                            blank_embeds = self._move_to_device(
+                                self.cached_blank_embeds.clone().detach(),
+                                dtype=dtype,
                             )
                             prior_embeds_to_use = concat_prompt_embeds(
                                 [blank_embeds] * noisy_latents.shape[0]
@@ -1888,7 +2330,7 @@ class SDTrainer(BaseSDTrainProcess):
                 self.before_unet_predict()
                 
                 if unconditional_embeds is not None:
-                    unconditional_embeds = unconditional_embeds.to(self.device_torch, dtype=dtype).detach()
+                    unconditional_embeds = self._move_to_device(unconditional_embeds, dtype=dtype).detach()
                 with self.timer('condition_noisy_latents'):
                     # do it for the model
                     noisy_latents = self.sd.condition_noisy_latents(noisy_latents, batch)
@@ -1905,9 +2347,9 @@ class SDTrainer(BaseSDTrainProcess):
                             
                             # do a sample at the current timestep and step it, then determine new noise
                             next_sample_pred = self.predict_noise(
-                                noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                                noisy_latents=noisy_latents,
                                 timesteps=timesteps,
-                                conditional_embeds=conditional_embeds.to(self.device_torch, dtype=dtype),
+                                conditional_embeds=conditional_embeds,
                                 unconditional_embeds=unconditional_embeds,
                                 batch=batch,
                                 **pred_kwargs
@@ -1920,7 +2362,7 @@ class SDTrainer(BaseSDTrainProcess):
                             )
                             # stepped latents is our new noisy latents. Now we need to determine noise in the current sample
                             noisy_latents = stepped_latents
-                            original_samples = batch.latents.to(self.device_torch, dtype=dtype)
+                            original_samples = self._move_to_device(batch.latents, dtype=dtype)
                             # todo calc next timestep, for now this may work as it
                             t_01 = (stepped_timesteps / 1000).to(original_samples.device)
                             if len(stepped_latents.shape) == 4:
@@ -1965,9 +2407,9 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     with self.timer('predict_unet'):
                         noise_pred = self.predict_noise(
-                            noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                            noisy_latents=noisy_latents,
                             timesteps=timesteps,
-                            conditional_embeds=conditional_embeds.to(self.device_torch, dtype=dtype),
+                            conditional_embeds=conditional_embeds,
                             unconditional_embeds=unconditional_embeds,
                             batch=batch,
                             is_primary_pred=True,
@@ -1976,7 +2418,7 @@ class SDTrainer(BaseSDTrainProcess):
                     self.after_unet_predict()
 
                     with self.timer('calculate_loss'):
-                        noise = noise.to(self.device_torch, dtype=dtype).detach()
+                        noise = self._move_to_device(noise, dtype=dtype).detach()
                         prior_to_calculate_loss = prior_pred
                         # if we are doing diff_output_preservation and not noing inverted masked prior
                         # then we need to send none here so it will not target the prior
@@ -2003,16 +2445,17 @@ class SDTrainer(BaseSDTrainProcess):
                             if self.train_config.diff_output_preservation:
                                 preservation_embeds = self.diff_output_preservation_embeds.expand_to_batch(noisy_latents.shape[0])
                             elif self.train_config.blank_prompt_preservation:
-                                blank_embeds = self.cached_blank_embeds.clone().detach().to(
-                                    self.device_torch, dtype=dtype
+                                blank_embeds = self._move_to_device(
+                                    self.cached_blank_embeds.clone().detach(),
+                                    dtype=dtype,
                                 )
                                 preservation_embeds = concat_prompt_embeds(
                                     [blank_embeds] * noisy_latents.shape[0]
                                 )
                         preservation_pred = self.predict_noise(
-                            noisy_latents=noisy_latents.to(self.device_torch, dtype=dtype),
+                            noisy_latents=noisy_latents,
                             timesteps=timesteps,
-                            conditional_embeds=preservation_embeds.to(self.device_torch, dtype=dtype),
+                            conditional_embeds=preservation_embeds,
                             unconditional_embeds=unconditional_embeds,
                             batch=batch,
                             **pred_kwargs
@@ -2054,8 +2497,13 @@ class SDTrainer(BaseSDTrainProcess):
         else:
             batch_list = [batch]
         total_loss = None
-        self.optimizer.zero_grad()
-        for batch in batch_list:
+        # OOM bookkeeping, read by BaseSDTrainProcess._record_oom_skip
+        self._current_microbatch_index = None
+        self._oom_phase = "before the first micro-batch"
+        self.optimizer.zero_grad(set_to_none=True)
+        for microbatch_index, batch in enumerate(batch_list):
+            self._current_microbatch_index = microbatch_index
+            self._oom_phase = "micro-batch"
             if self.sd.is_multistage:
                 # handle multistage switching
                 if self.steps_this_boundary >= self.train_config.switch_boundary_every or self.current_boundary_index not in self.sd.trainable_multistage_boundaries:
@@ -2068,6 +2516,7 @@ class SDTrainer(BaseSDTrainProcess):
                         if self.current_boundary_index in self.sd.trainable_multistage_boundaries:
                             # if this boundary is trainable, we can stop looking
                             break
+            self.hook_before_forward_pass(microbatch_index, batch)
             loss = self.train_single_accumulation(batch)
             self.steps_this_boundary += 1
             if total_loss is None:
@@ -2078,7 +2527,14 @@ class SDTrainer(BaseSDTrainProcess):
                 torch.cuda.empty_cache()
 
 
+        # every micro-batch has finished forward + backward: an OOM from here on is not
+        # any single image's fault
+        self._current_microbatch_index = None
+        self._oom_phase = "after all micro-batches (grad sync / clipping / optimizer step / EMA / scheduler)"
         if not self.is_grad_accumulation_step:
+            # grads of memory-managed (offloaded) params are async D2H copies into
+            # pinned tensors; join them before anything on the CPU reads .grad
+            sync_grad_transfers()
             # fix this for multi params
             if self.train_config.optimizer != 'adafactor':
                 if isinstance(self.params[0], dict):
@@ -2087,8 +2543,15 @@ class SDTrainer(BaseSDTrainProcess):
                 else:
                     self.accelerator.clip_grad_norm_(self.params, self.train_config.max_grad_norm)
             # only step if we are not accumulating
+            optimizer_update_probe = self.capture_optimizer_update_probe()
+            skip_optimizer_step = self.should_skip_nonfinite_optimizer_step(optimizer_update_probe)
             with self.timer('optimizer_step'):
-                self.optimizer.step()
+                if not skip_optimizer_step:
+                    # set BEFORE step(): an OOM part-way through step() may already have
+                    # updated some parameters, so that step must never be retried either
+                    self._oom_lora_updated = True
+                    self.optimizer.step()
+                    self.finalize_optimizer_update_probe(optimizer_update_probe)
 
                 self.optimizer.zero_grad(set_to_none=True)
                 if self.adapter and isinstance(self.adapter, CustomAdapter):

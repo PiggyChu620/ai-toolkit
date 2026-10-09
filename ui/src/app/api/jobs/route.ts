@@ -1,24 +1,29 @@
 import { NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
-
-const prisma = new PrismaClient();
+import prisma from '@/server/prisma';
+import { getTrainingFolder } from '@/server/settings';
+import { reconcileJobProcessState, reconcileJobProcessStates } from '@/server/jobProcess';
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const id = searchParams.get('id');
 
   try {
+    const trainingRoot = await getTrainingFolder();
+
     if (id) {
       const job = await prisma.job.findUnique({
         where: { id },
       });
-      return NextResponse.json(job);
+      if (!job) {
+        return NextResponse.json(null);
+      }
+      return NextResponse.json(await reconcileJobProcessState(job, trainingRoot));
     }
 
     const jobs = await prisma.job.findMany({
       orderBy: { created_at: 'desc' },
     });
-    return NextResponse.json({ jobs: jobs });
+    return NextResponse.json({ jobs: await reconcileJobProcessStates(jobs, trainingRoot) });
   } catch (error) {
     console.error(error);
     return NextResponse.json({ error: 'Failed to fetch training data' }, { status: 500 });

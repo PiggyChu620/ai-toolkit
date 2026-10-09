@@ -10,11 +10,17 @@ export interface LossPoint {
 }
 
 type SeriesMap = Record<string, LossPoint[]>;
+const MAX_POINTS_PER_SERIES = 20_000;
 
 function isLossKey(key: string) {
   // treat anything containing "loss" as a loss-series
   // (covers loss, train_loss, val_loss, loss/xyz, etc.)
   return /loss/i.test(key);
+}
+
+function trimSeries(points: LossPoint[]) {
+  if (points.length <= MAX_POINTS_PER_SERIES) return points;
+  return points.slice(points.length - MAX_POINTS_PER_SERIES);
 }
 
 export default function useJobLossLog(jobID: string, reloadInterval: null | number = null) {
@@ -64,7 +70,7 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
           params.since_step = lastStepByKeyRef.current[k];
         }
 
-        params.limit = 1000000;
+        params.limit = MAX_POINTS_PER_SERIES;
 
         return apiClient
           .get(`/api/jobs/${jobID}/loss`, { params })
@@ -82,12 +88,12 @@ export default function useJobLossLog(jobID: string, reloadInterval: null | numb
 
           if (!didInitialLoadRef.current) {
             // initial: replace
-            next[k] = newPoints;
+            next[k] = trimSeries(newPoints);
           } else if (newPoints.length) {
             const existing = next[k] ?? [];
             const prevLast = existing.length ? existing[existing.length - 1].step : null;
             const filtered = prevLast == null ? newPoints : newPoints.filter(p => p.step > prevLast);
-            next[k] = filtered.length ? [...existing, ...filtered] : existing;
+            next[k] = filtered.length ? trimSeries([...existing, ...filtered]) : existing;
           } else {
             // no new points: keep existing
             next[k] = next[k] ?? [];

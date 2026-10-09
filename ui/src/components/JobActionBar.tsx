@@ -1,12 +1,11 @@
 import Link from 'next/link';
-import { Eye, Trash2, Pen, Play, Pause, Cog, X } from 'lucide-react';
+import { Eye, Trash2, Pen, Play, Pause, Cog, X, RotateCcw, CircleStop } from 'lucide-react';
 import { Button } from '@headlessui/react';
 import { openConfirm } from '@/components/ConfirmModal';
 import { Job } from '@prisma/client';
-import { startJob, stopJob, deleteJob, getAvaliableJobActions, markJobAsStopped } from '@/utils/jobs';
+import { startJob, stopJob, restartJob, deleteJob, getAvaliableJobActions, markJobAsStopped } from '@/utils/jobs';
 import { startQueue } from '@/utils/queue';
 import { Menu, MenuButton, MenuItem, MenuItems } from '@headlessui/react';
-import { redirect } from 'next/navigation';
 
 interface JobActionBarProps {
   job: Job;
@@ -25,7 +24,8 @@ export default function JobActionBar({
   hideView,
   autoStartQueue = false,
 }: JobActionBarProps) {
-  const { canStart, canStop, canDelete, canEdit, canRemoveFromQueue } = getAvaliableJobActions(job);
+  const { canStart, canStop, canStopNow, canDelete, canEdit, canRestart, canRemoveFromQueue } =
+    getAvaliableJobActions(job);
 
   if (!afterDelete) afterDelete = onRefresh;
 
@@ -79,6 +79,51 @@ export default function JobActionBar({
           <Pause />
         </Button>
       )}
+      {canStopNow && (
+        <Button
+          onClick={() => {
+            if (!canStopNow) return;
+            openConfirm({
+              title: 'Stop Now',
+              message: `"${job.name}" is saving the step it was on before it stops. Stop it right now instead? The training since its last saved checkpoint will be lost.`,
+              type: 'warning',
+              confirmText: 'Stop now',
+              onConfirm: async () => {
+                await stopJob(job.id, true);
+                if (onRefresh) onRefresh();
+              },
+            });
+          }}
+          className={`ml-2 opacity-100 text-red-400`}
+          title="Stop now, without saving"
+        >
+          <CircleStop />
+        </Button>
+      )}
+      {canRestart && (
+        <Button
+          onClick={() => {
+            if (!canRestart) return;
+            openConfirm({
+              title: 'Restart Job',
+              message: `Are you sure you want to restart the job "${job.name}" from step 0? This will permanently remove its current checkpoints, optimizer state, samples, and logs before queueing it again.`,
+              type: 'warning',
+              confirmText: 'Restart',
+              onConfirm: async () => {
+                await restartJob(job.id);
+                if (autoStartQueue) {
+                  await startQueue(job.gpu_ids);
+                }
+                if (onRefresh) onRefresh();
+              },
+            });
+          }}
+          className={`ml-2 opacity-100`}
+          title="Restart from step 0"
+        >
+          <RotateCcw />
+        </Button>
+      )}
       {!hideView && (
         <Link href={`/jobs/${job.id}`} className="ml-2 text-gray-200 hover:text-gray-100 inline-block">
           <Eye />
@@ -103,7 +148,7 @@ export default function JobActionBar({
             onConfirm: async () => {
               if (job.status === 'running') {
                 try {
-                  await stopJob(job.id);
+                  await stopJob(job.id, true); // it is being deleted: no point saving it first
                 } catch (e) {
                   console.error('Error stopping job before deleting:', e);
                 }

@@ -74,6 +74,33 @@ class BaseTrainProcess(BaseProcess):
 
     def save_training_config(self):
         os.makedirs(self.save_root, exist_ok=True)
-        save_dif = os.path.join(self.save_root, f'config.yaml')
+
+        # This file is an OUTPUT, never an input. The UI launches run.py with
+        # .job_config.json, regenerated from aitk_db.db on every start; nothing in
+        # the tree ever reads this dump back. Hand-editing it therefore changes
+        # nothing, silently -- and the next run overwrites the edit. Warn loudly
+        # instead of clobbering, because a silent discard is exactly what makes it
+        # look like the trainer is ignoring a setting.
+        save_dif = os.path.join(self.save_root, 'config.used.yaml')
+        legacy = os.path.join(self.save_root, 'config.yaml')
+        if os.path.exists(legacy):
+            try:
+                with open(legacy, 'r') as f:
+                    previous = yaml.safe_load(f)
+            except Exception:
+                previous = None
+            if previous is not None and previous != self.job.raw_config:
+                print(
+                    f"\nWARNING: {legacy} differs from the config this run was "
+                    f"launched with, and it is NOT an input -- it is a dump of the "
+                    f"previous run. Any edits to it were ignored. Change the setting "
+                    f"in the UI (it lives in aitk_db.db and is written to "
+                    f".job_config.json at launch).\n"
+                )
+
         with open(save_dif, 'w') as f:
+            f.write("# AUTO-GENERATED record of the config this run was launched with.\n")
+            f.write("# Editing this file does NOTHING: it is an output, never an input.\n")
+            f.write("# The live config lives in the UI / aitk_db.db and reaches the\n")
+            f.write("# trainer via .job_config.json, regenerated on every start.\n")
             yaml.dump(self.job.raw_config, f)

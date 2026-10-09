@@ -8,7 +8,7 @@ import {
   defaultQtype,
   jobTypeOptions,
 } from './options';
-import { defaultDatasetConfig } from './jobConfig';
+import { defaultAdapterConfig, defaultDatasetConfig, defaultNetworkConfig } from './jobConfig';
 import { GroupedSelectOption, JobConfig, SelectOption } from '@/types';
 import { objectCopy } from '@/utils/basic';
 import { TextInput, SelectInput, Checkbox, FormGroup, NumberInput, SliderInput } from '@/components/formInputs';
@@ -65,6 +65,21 @@ export default function SimpleJob({
   }, [modelArch, jobType]);
 
   const isVideoModel = !!(modelArch?.group === 'video');
+
+  const trainingTargetType = useMemo(() => {
+    if (jobConfig.config.process[0].adapter?.train) {
+      return 'ip_adapter';
+    }
+    return jobConfig.config.process[0].network?.type ?? 'lora';
+  }, [jobConfig.config.process]);
+
+  const adapterTestImagePathsValue = useMemo(() => {
+    return (jobConfig.config.process[0].adapter?.test_img_path ?? []).join(', ');
+  }, [jobConfig.config.process]);
+
+  // Train by Epoch: the input becomes "epochs"; the exact step count is resolved
+  // in Python at runtime from the loaded dataset (see _resolve_epoch_based_steps).
+  const trainByEpoch = !!jobConfig.config.process[0].train.train_by_epoch;
 
   const numTopCards = useMemo(() => {
     let count = 4; // job settings, model config, target config, save config
@@ -226,6 +241,20 @@ export default function SimpleJob({
                   checked={jobConfig.config.process[0].model.low_vram}
                   onChange={value => setJobConfig(value, 'config.process[0].model.low_vram')}
                 />
+                <div className="pt-2">
+                  <Checkbox
+                    label="Auto Low VRAM"
+                    checked={jobConfig.config.process[0].model.auto_low_vram ?? false}
+                    onChange={value => setJobConfig(value, 'config.process[0].model.auto_low_vram')}
+                    docKey="model.auto_low_vram"
+                  />
+                  {jobConfig.config.process[0].model.auto_low_vram && (
+                    <p className="pt-2 text-xs text-zinc-400">
+                      Low VRAM is resolved when training starts using the current free VRAM on the active GPU. The
+                      manual Low VRAM toggle is kept as a fallback if the runtime VRAM query fails.
+                    </p>
+                  )}
+                </div>
               </FormGroup>
             )}
             {modelArch?.additionalSections?.includes('model.qie.match_target_res') && (
@@ -250,6 +279,18 @@ export default function SimpleJob({
                 />
                 {jobConfig.config.process[0].model.layer_offloading && (
                   <div className="pt-2">
+                    <Checkbox
+                      label="Auto Offload %"
+                      checked={jobConfig.config.process[0].model.auto_layer_offloading_percent ?? false}
+                      onChange={value => setJobConfig(value, 'config.process[0].model.auto_layer_offloading_percent')}
+                      docKey="model.auto_layer_offloading_percent"
+                    />
+                    {jobConfig.config.process[0].model.auto_layer_offloading_percent && (
+                      <p className="pt-2 text-xs text-zinc-400">
+                        Offload percentages are resolved when training starts using the current free VRAM on the active
+                        GPU. Manual sliders are ignored while this is enabled.
+                      </p>
+                    )}
                     <SliderInput
                       label="Transformer Offload %"
                       value={Math.round(
@@ -261,6 +302,7 @@ export default function SimpleJob({
                       min={0}
                       max={100}
                       step={1}
+                      disabled={jobConfig.config.process[0].model.auto_layer_offloading_percent ?? false}
                     />
                     <SliderInput
                       label="Text Encoder Offload %"
@@ -273,6 +315,7 @@ export default function SimpleJob({
                       min={0}
                       max={100}
                       step={1}
+                      disabled={jobConfig.config.process[0].model.auto_layer_offloading_percent ?? false}
                     />
                   </div>
                 )}
@@ -339,14 +382,40 @@ export default function SimpleJob({
           <Card title="Target">
             <SelectInput
               label="Target Type"
-              value={jobConfig.config.process[0].network?.type ?? 'lora'}
-              onChange={value => setJobConfig(value, 'config.process[0].network.type')}
+              value={trainingTargetType}
+              onChange={value => {
+                if (value === 'ip_adapter') {
+                  const nextAdapter = objectCopy(jobConfig.config.process[0].adapter || defaultAdapterConfig);
+                  nextAdapter.type = 'ip';
+                  nextAdapter.train = true;
+                  nextAdapter.test_img_path = nextAdapter.test_img_path || [];
+                  setJobConfig(undefined, 'config.process[0].network');
+                  setJobConfig(nextAdapter, 'config.process[0].adapter');
+                  setJobConfig(false, 'config.process[0].train.train_unet');
+                  setJobConfig(false, 'config.process[0].train.train_text_encoder');
+                  setJobConfig(
+                    jobConfig.config.process[0].train.adapter_lr ?? jobConfig.config.process[0].train.lr,
+                    'config.process[0].train.adapter_lr',
+                  );
+                } else {
+                  const nextNetwork = objectCopy(jobConfig.config.process[0].network || defaultNetworkConfig);
+                  nextNetwork.type = value;
+                  nextNetwork.network_kwargs = nextNetwork.network_kwargs || { ignore_if_contains: [] };
+                  nextNetwork.network_kwargs.ignore_if_contains =
+                    nextNetwork.network_kwargs.ignore_if_contains || [];
+                  setJobConfig(nextNetwork, 'config.process[0].network');
+                  setJobConfig(undefined, 'config.process[0].adapter');
+                  setJobConfig(true, 'config.process[0].train.train_unet');
+                  setJobConfig(false, 'config.process[0].train.train_text_encoder');
+                }
+              }}
               options={[
                 { value: 'lora', label: 'LoRA' },
                 { value: 'lokr', label: 'LoKr' },
+                { value: 'ip_adapter', label: 'IP-Adapter' },
               ]}
             />
-            {jobConfig.config.process[0].network?.type == 'lokr' && (
+            {trainingTargetType == 'lokr' && (
               <SelectInput
                 label="LoKr Factor"
                 value={`${jobConfig.config.process[0].network?.lokr_factor ?? -1}`}
@@ -360,11 +429,11 @@ export default function SimpleJob({
                 ]}
               />
             )}
-            {jobConfig.config.process[0].network?.type == 'lora' && (
+            {trainingTargetType == 'lora' && (
               <>
                 <NumberInput
                   label="Linear Rank"
-                  value={jobConfig.config.process[0].network.linear}
+                  value={jobConfig.config.process[0].network?.linear ?? 0}
                   onChange={value => {
                     console.log('onChange', value);
                     setJobConfig(value, 'config.process[0].network.linear');
@@ -378,7 +447,7 @@ export default function SimpleJob({
                 {disableSections.includes('network.conv') ? null : (
                   <NumberInput
                     label="Conv Rank"
-                    value={jobConfig.config.process[0].network.conv}
+                    value={jobConfig.config.process[0].network?.conv ?? 0}
                     onChange={value => {
                       console.log('onChange', value);
                       setJobConfig(value, 'config.process[0].network.conv');
@@ -389,6 +458,122 @@ export default function SimpleJob({
                     max={1024}
                   />
                 )}
+              </>
+            )}
+            {(trainingTargetType == 'lora' || trainingTargetType == 'lokr') && (
+              <>
+                <TextInput
+                  label="Load LoRA"
+                  value={jobConfig.config.process[0].network?.pretrained_lora_path ?? ''}
+                  onChange={(value: string | undefined) => {
+                    if (value?.trim() === '') {
+                      value = undefined;
+                    }
+                    setJobConfig(value, 'config.process[0].network.pretrained_lora_path');
+                  }}
+                  placeholder="Optional path to an existing LoRA"
+                  docKey="network.pretrained_lora_path"
+                />
+                <Checkbox
+                  label="Resume Imported Training State"
+                  checked={jobConfig.config.process[0].network?.resume_training_state || false}
+                  onChange={value => setJobConfig(value, 'config.process[0].network.resume_training_state')}
+                  docKey="network.resume_training_state"
+                />
+              </>
+            )}
+            {trainingTargetType == 'ip_adapter' && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextDatasets = jobConfig.config.process[0].datasets.map(dataset => {
+                      if (dataset.is_reg) {
+                        return dataset;
+                      }
+                      return {
+                        ...objectCopy(dataset),
+                        clip_image_path: null,
+                        clip_image_from_same_folder: true,
+                        clip_image_from_same_folder_balanced: true,
+                      };
+                    });
+                    setJobConfig(nextDatasets, 'config.process[0].datasets');
+                  }}
+                  className="w-full px-4 py-2 mb-3 bg-gray-700 hover:bg-gray-600 rounded-lg transition-colors text-left"
+                >
+                  Apply Character Folder Preset
+                </button>
+                <p className="text-xs text-gray-500 pb-3">
+                  Uses each non-regularization dataset folder as the target set and picks the reference image from the
+                  same character subfolder with balanced same-folder pairing enabled.
+                </p>
+                <TextInput
+                  label="Image Encoder Path"
+                  value={jobConfig.config.process[0].adapter?.image_encoder_path ?? defaultAdapterConfig.image_encoder_path ?? ''}
+                  onChange={(value: string | undefined) => {
+                    if (value?.trim() === '') {
+                      value = undefined;
+                    }
+                    setJobConfig(value, 'config.process[0].adapter.image_encoder_path');
+                  }}
+                  placeholder="eg. openai/clip-vit-large-patch14"
+                />
+                <SelectInput
+                  label="Image Encoder Arch"
+                  value={jobConfig.config.process[0].adapter?.image_encoder_arch ?? defaultAdapterConfig.image_encoder_arch ?? 'clip'}
+                  onChange={value => setJobConfig(value, 'config.process[0].adapter.image_encoder_arch')}
+                  options={[
+                    { value: 'clip', label: 'CLIP' },
+                    { value: 'siglip', label: 'SigLIP' },
+                    { value: 'vit', label: 'ViT' },
+                    { value: 'vit-hybrid', label: 'ViT Hybrid' },
+                    { value: 'safe', label: 'SAFE' },
+                    { value: 'convnext', label: 'ConvNeXt' },
+                  ]}
+                />
+                <SelectInput
+                  label="CLIP Layer"
+                  value={jobConfig.config.process[0].adapter?.clip_layer ?? defaultAdapterConfig.clip_layer ?? 'last_hidden_state'}
+                  onChange={value => setJobConfig(value, 'config.process[0].adapter.clip_layer')}
+                  options={[
+                    { value: 'last_hidden_state', label: 'Last Hidden State' },
+                    { value: 'penultimate_hidden_states', label: 'Penultimate Hidden State' },
+                    { value: 'image_embeds', label: 'Image Embeds' },
+                  ]}
+                />
+                <Checkbox
+                  label="Train Image Encoder"
+                  checked={jobConfig.config.process[0].adapter?.train_image_encoder || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].adapter.train_image_encoder');
+                    if (!value && jobConfig.config.process[0].adapter?.train_only_image_encoder) {
+                      setJobConfig(false, 'config.process[0].adapter.train_only_image_encoder');
+                    }
+                  }}
+                />
+                <Checkbox
+                  label="Train Only Image Encoder"
+                  checked={jobConfig.config.process[0].adapter?.train_only_image_encoder || false}
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].adapter.train_only_image_encoder');
+                    if (value) {
+                      setJobConfig(true, 'config.process[0].adapter.train_image_encoder');
+                    }
+                  }}
+                />
+                <TextInput
+                  label="Sample Reference Images"
+                  value={adapterTestImagePathsValue}
+                  onChange={(value: string | undefined) => {
+                    const nextValue = (value || '')
+                      .split(',')
+                      .map(part => part.trim())
+                      .filter(part => part.length > 0);
+                    setJobConfig(nextValue, 'config.process[0].adapter.test_img_path');
+                  }}
+                  placeholder="Comma-separated image paths for sample previews"
+                />
               </>
             )}
           </Card>
@@ -474,15 +659,52 @@ export default function SimpleJob({
                   min={1}
                   required
                 />
-                <NumberInput
-                  label="Steps"
-                  className="pt-2"
-                  value={jobConfig.config.process[0].train.steps}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.steps')}
-                  placeholder="eg. 2000"
-                  min={1}
-                  required
+                <Checkbox
+                  label="Train by Epoch"
+                  className="pt-3"
+                  checked={trainByEpoch}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.train_by_epoch')}
                 />
+                {trainByEpoch ? (
+                  <>
+                    <NumberInput
+                      label="Epochs"
+                      className="pt-2"
+                      value={jobConfig.config.process[0].train.epochs ?? 1}
+                      onChange={value => setJobConfig(value, 'config.process[0].train.epochs')}
+                      placeholder="eg. 10"
+                      min={1}
+                      required
+                    />
+                    <div className="text-xs text-gray-400 mt-1">
+                      Actual steps are computed from the loaded dataset when training starts (epochs ×
+                      batches-per-epoch ÷ gradient accumulation).
+                    </div>
+                  </>
+                ) : (
+                  <NumberInput
+                    label="Steps"
+                    className="pt-2"
+                    value={jobConfig.config.process[0].train.steps}
+                    onChange={value => setJobConfig(value, 'config.process[0].train.steps')}
+                    placeholder="eg. 2000"
+                    min={1}
+                    required
+                  />
+                )}
+                <Checkbox
+                  label="Global Bucket Batching"
+                  className="pt-3"
+                  checked={!!jobConfig.config.process[0].train.global_bucket_batching}
+                  onChange={value => setJobConfig(value, 'config.process[0].train.global_bucket_batching')}
+                />
+                <div className="text-xs text-gray-400 mt-1">
+                  Pool every dataset into one bucket map so a single batch can mix images from
+                  different folders that share a bucket. Items whose tensors cannot stack (images vs
+                  videos, different frame counts, different control/mask setups) stay in separate
+                  groups. Merging partial batches lowers batches-per-epoch, so Train by Epoch
+                  resolves to fewer steps.
+                </div>
               </div>
               <div>
                 <SelectInput
@@ -495,10 +717,19 @@ export default function SimpleJob({
                   ]}
                 />
                 <NumberInput
-                  label="Learning Rate"
+                  label={trainingTargetType === 'ip_adapter' ? 'Adapter Learning Rate' : 'Learning Rate'}
                   className="pt-2"
-                  value={jobConfig.config.process[0].train.lr}
-                  onChange={value => setJobConfig(value, 'config.process[0].train.lr')}
+                  value={
+                    trainingTargetType === 'ip_adapter'
+                      ? (jobConfig.config.process[0].train.adapter_lr ?? jobConfig.config.process[0].train.lr)
+                      : jobConfig.config.process[0].train.lr
+                  }
+                  onChange={value => {
+                    setJobConfig(value, 'config.process[0].train.lr');
+                    if (trainingTargetType === 'ip_adapter') {
+                      setJobConfig(value, 'config.process[0].train.adapter_lr');
+                    }
+                  }}
                   placeholder="eg. 0.0001"
                   min={0}
                   required
@@ -605,10 +836,57 @@ export default function SimpleJob({
                       setJobConfig(value, 'config.process[0].train.cache_text_embeddings');
                       if (value) {
                         setJobConfig(false, 'config.process[0].train.unload_text_encoder');
+                        setJobConfig(
+                          jobConfig.config.process[0].datasets.map(dataset => ({
+                            ...dataset,
+                            lazy_cache_text_embeddings: true,
+                          })),
+                          'config.process[0].datasets',
+                        );
                       }
                     }}
                   />
                 </FormGroup>
+                <FormGroup label="UI + Runtime" className="pt-4">
+                  <Checkbox
+                    label="Clean All Caches on Startup"
+                    checked={jobConfig.config.process[0].cleanup_caches_on_startup ?? false}
+                    onChange={value => setJobConfig(value, 'config.process[0].cleanup_caches_on_startup')}
+                    docKey="process.cleanup_caches_on_startup"
+                  />
+                </FormGroup>
+                <NumberInput
+                  label="Perf Log Every"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].performance_log_every ?? 10}
+                  onChange={value => setJobConfig(value, 'config.process[0].performance_log_every')}
+                  placeholder="eg. 10"
+                  min={0}
+                />
+                <NumberInput
+                  label="UI Log Every"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].logging.log_every}
+                  onChange={value => setJobConfig(value, 'config.process[0].logging.log_every')}
+                  placeholder="eg. 10"
+                  min={1}
+                />
+                <NumberInput
+                  label="UI Step Update (sec)"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].ui_step_update_interval ?? 1}
+                  onChange={value => setJobConfig(value, 'config.process[0].ui_step_update_interval')}
+                  placeholder="eg. 1.0"
+                  min={0.1}
+                />
+                <NumberInput
+                  label="Stop Poll (sec)"
+                  className="pt-2"
+                  value={jobConfig.config.process[0].ui_stop_poll_interval ?? 1}
+                  onChange={value => setJobConfig(value, 'config.process[0].ui_stop_poll_interval')}
+                  placeholder="eg. 1.0"
+                  min={0.1}
+                />
               </div>
               <div>
                 {disableSections.includes('train.diff_output_preservation') ||
@@ -814,8 +1092,52 @@ export default function SimpleJob({
                           />
                         </>
                       )}
+                      {trainingTargetType === 'ip_adapter' && (
+                        <>
+                          <SelectInput
+                            label="Reference Dataset"
+                            value={dataset.clip_image_path ?? ''}
+                            className="pt-2"
+                            onChange={value => {
+                              const nextValue = value == '' ? null : value;
+                              setJobConfig(nextValue, `config.process[0].datasets[${i}].clip_image_path`);
+                              if (nextValue) {
+                                setJobConfig(false, `config.process[0].datasets[${i}].clip_image_from_same_folder`);
+                                setJobConfig(
+                                  false,
+                                  `config.process[0].datasets[${i}].clip_image_from_same_folder_balanced`,
+                                );
+                              }
+                            }}
+                            options={[{ value: '', label: <>&nbsp;</> }, ...datasetOptions]}
+                          />
+                          <Checkbox
+                            label="Reference From Same Folder"
+                            checked={dataset.clip_image_from_same_folder || false}
+                            onChange={value => {
+                              setJobConfig(value, `config.process[0].datasets[${i}].clip_image_from_same_folder`);
+                              if (value) {
+                                setJobConfig(null, `config.process[0].datasets[${i}].clip_image_path`);
+                              } else {
+                                setJobConfig(
+                                  false,
+                                  `config.process[0].datasets[${i}].clip_image_from_same_folder_balanced`,
+                                );
+                              }
+                            }}
+                          />
+                          <Checkbox
+                            label="Balance Same-Folder Pairing"
+                            checked={dataset.clip_image_from_same_folder_balanced || false}
+                            disabled={!(dataset.clip_image_from_same_folder || false)}
+                            onChange={value =>
+                              setJobConfig(value, `config.process[0].datasets[${i}].clip_image_from_same_folder_balanced`)
+                            }
+                          />
+                        </>
+                      )}
                       <NumberInput
-                        label="LoRA Weight"
+                        label={trainingTargetType === 'ip_adapter' ? 'Dataset Weight' : 'LoRA Weight'}
                         value={dataset.network_weight}
                         className="pt-2"
                         onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].network_weight`)}
@@ -846,6 +1168,13 @@ export default function SimpleJob({
                         min={0}
                         required
                       />
+                      <Checkbox
+                        label="Must Include Caption"
+                        checked={dataset.must_include_caption || false}
+                        onChange={value =>
+                          setJobConfig(value, `config.process[0].datasets[${i}].must_include_caption`)
+                        }
+                      />
                       {modelArch?.additionalSections?.includes('datasets.num_frames') && (
                         <NumberInput
                           label="Num Frames"
@@ -862,12 +1191,98 @@ export default function SimpleJob({
                     <div>
                       <FormGroup label="Settings" className="">
                         <Checkbox
-                          label="Cache Latents"
-                          checked={dataset.cache_latents_to_disk || false}
-                          onChange={value =>
-                            setJobConfig(value, `config.process[0].datasets[${i}].cache_latents_to_disk`)
-                          }
+                          label="Cache Latents in RAM"
+                          checked={dataset.cache_latents || false}
+                          disabled={dataset.lazy_cache_latents || false}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].cache_latents`)}
                         />
+                        <Checkbox
+                          label="Cache Latents to Disk"
+                          checked={dataset.cache_latents_to_disk || false}
+                          onChange={value => {
+                            setJobConfig(value, `config.process[0].datasets[${i}].cache_latents_to_disk`);
+                            if (!value && dataset.lazy_cache_latents) {
+                              setJobConfig(false, `config.process[0].datasets[${i}].lazy_cache_latents`);
+                            }
+                          }}
+                        />
+                        <Checkbox
+                          label="Lazy Cache Latents"
+                          checked={dataset.lazy_cache_latents || false}
+                          onChange={value => {
+                            if (value) {
+                              setJobConfig(true, `config.process[0].datasets[${i}].cache_latents_to_disk`);
+                              setJobConfig(false, `config.process[0].datasets[${i}].cache_latents`);
+                            }
+                            setJobConfig(value, `config.process[0].datasets[${i}].lazy_cache_latents`);
+                          }}
+                        />
+                        {dataset.lazy_cache_latents ? (
+                          <p className="text-xs text-gray-500">
+                            Lazy latent caching uses disk cache only and turns off RAM latent caching.
+                          </p>
+                        ) : null}
+                        <Checkbox
+                          label="Train from Caches Only"
+                          checked={dataset.caches_only || false}
+                          onChange={value => {
+                            if (value) {
+                              setJobConfig(true, `config.process[0].datasets[${i}].cache_latents_to_disk`);
+                            }
+                            setJobConfig(value, `config.process[0].datasets[${i}].caches_only`);
+                          }}
+                          docKey="dataset.caches_only"
+                        />
+                        {dataset.caches_only ? (
+                          <p className="text-xs text-gray-500">
+                            Trains directly from previously built disk caches. Source images and caption files are not
+                            required to exist.
+                          </p>
+                        ) : null}
+                        <TextInput
+                          label="Cache Directory Override"
+                          value={dataset.cache_dir_override || ''}
+                          onChange={value =>
+                            setJobConfig(
+                              value === '' ? null : value,
+                              `config.process[0].datasets[${i}].cache_dir_override`,
+                            )
+                          }
+                          placeholder="eg. D:\\aitk-cache"
+                          docKey="dataset.cache_dir_override"
+                        />
+                        <NumberInput
+                          label="Override Min Free GB"
+                          value={dataset.cache_dir_override_min_free_gb ?? 10}
+                          onChange={value =>
+                            setJobConfig(value, `config.process[0].datasets[${i}].cache_dir_override_min_free_gb`)
+                          }
+                          placeholder="eg. 10"
+                          min={0}
+                          docKey="dataset.cache_dir_override_min_free_gb"
+                        />
+                        {jobConfig.config.process[0].train.cache_text_embeddings && (
+                          <>
+                            <Checkbox
+                              label="Lazy Cache Text Embeddings"
+                              checked={dataset.lazy_cache_text_embeddings || false}
+                              onChange={value =>
+                                setJobConfig(value, `config.process[0].datasets[${i}].lazy_cache_text_embeddings`)
+                              }
+                              docKey="dataset.lazy_cache_text_embeddings"
+                            />
+                            <NumberInput
+                              label="Text Cache Shard Size"
+                              value={dataset.text_embedding_cache_shard_size || 64}
+                              onChange={value =>
+                                setJobConfig(value, `config.process[0].datasets[${i}].text_embedding_cache_shard_size`)
+                              }
+                              placeholder="eg. 64"
+                              min={1}
+                              docKey="dataset.text_embedding_cache_shard_size"
+                            />
+                          </>
+                        )}
                         <Checkbox
                           label="Is Regularization"
                           checked={dataset.is_reg || false}
@@ -923,6 +1338,43 @@ export default function SimpleJob({
                             docKey="datasets.audio_preserve_pitch"
                           />
                         )}
+                      </FormGroup>
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <NumberInput
+                          label="Workers"
+                          value={dataset.num_workers ?? 2}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].num_workers`)}
+                          placeholder="eg. 2"
+                          min={0}
+                        />
+                        <NumberInput
+                          label="Prefetch"
+                          value={dataset.prefetch_factor ?? 2}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].prefetch_factor`)}
+                          placeholder="eg. 2"
+                          min={1}
+                        />
+                      </div>
+                      <FormGroup label="Data Loader" className="mt-2">
+                        <Checkbox
+                          label="Persistent Workers"
+                          checked={dataset.persistent_workers ?? true}
+                          onChange={value =>
+                            setJobConfig(value, `config.process[0].datasets[${i}].persistent_workers`)
+                          }
+                        />
+                        <Checkbox
+                          label="Pin Memory"
+                          checked={dataset.pin_memory ?? true}
+                          onChange={value => setJobConfig(value, `config.process[0].datasets[${i}].pin_memory`)}
+                        />
+                        <Checkbox
+                          label="Enable Workers on Windows"
+                          checked={dataset.enable_windows_num_workers || false}
+                          onChange={value =>
+                            setJobConfig(value, `config.process[0].datasets[${i}].enable_windows_num_workers`)
+                          }
+                        />
                       </FormGroup>
                       <FormGroup label="Flipping" docKey={'datasets.flip'} className="mt-2">
                         <Checkbox

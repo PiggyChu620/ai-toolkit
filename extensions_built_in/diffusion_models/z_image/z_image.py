@@ -64,6 +64,19 @@ class ZImageModel(BaseModel):
     def get_bucket_divisibility(self):
         return 16 * 2  # 16 for the VAE, 2 for patch size
 
+    def _ensure_model_on_predict_device(self):
+        memory_manager = getattr(self.model, "_memory_manager", None)
+        if (
+            memory_manager is not None
+            and getattr(
+                memory_manager,
+                "unmanaged_modules_ready_on_process_device",
+                False,
+            )
+        ):
+            return
+        self.model.to(self.device_torch)
+
     def load_training_adapter(self, transformer: ZImageTransformer2DModel):
         self.print_and_status_update("Loading assistant LoRA")
         lora_path = self.model_config.assistant_lora_path
@@ -152,23 +165,40 @@ class ZImageModel(BaseModel):
         self.print_and_status_update("Loading ZImage model")
         model_path = self.model_config.name_or_path
         base_model_path = self.model_config.extras_name_or_path
+        model_dtype = dtype
+
+        if model_path.endswith(".safetensors") and (
+            not base_model_path or base_model_path.endswith(".safetensors")
+        ):
+            # Single-file checkpoints still need a diffusers-style repo/folder for
+            # tokenizer, text encoder, and VAE assets.
+            base_model_path = "Tongyi-MAI/Z-Image-Turbo"
 
         self.print_and_status_update("Loading transformer")
 
-        transformer_path = model_path
-        transformer_subfolder = "transformer"
-        if os.path.exists(transformer_path):
-            transformer_subfolder = None
-            transformer_path = os.path.join(transformer_path, "transformer")
-            # check if the path is a full checkpoint.
-            te_folder_path = os.path.join(model_path, "text_encoder")
-            # if we have the te, this folder is a full checkpoint, use it as the base
-            if os.path.exists(te_folder_path):
-                base_model_path = model_path
+        if model_path.endswith(".safetensors"):
+            transformer = ZImageTransformer2DModel.from_single_file(
+                model_path,
+                config=base_model_path,
+                subfolder="transformer",
+                torch_dtype=model_dtype,
+            )
+            transformer.to(model_dtype)
+        else:
+            transformer_path = model_path
+            transformer_subfolder = "transformer"
+            if os.path.exists(transformer_path):
+                transformer_subfolder = None
+                transformer_path = os.path.join(transformer_path, "transformer")
+                # check if the path is a full checkpoint.
+                te_folder_path = os.path.join(model_path, "text_encoder")
+                # if we have the te, this folder is a full checkpoint, use it as the base
+                if os.path.exists(te_folder_path):
+                    base_model_path = model_path
 
-        transformer = ZImageTransformer2DModel.from_pretrained(
-            transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
-        )
+            transformer = ZImageTransformer2DModel.from_pretrained(
+                transformer_path, subfolder=transformer_subfolder, torch_dtype=dtype
+            )
 
         # load assistant lora if specified
         if self.model_config.assistant_lora_path is not None:
@@ -193,7 +223,11 @@ class ZImageModel(BaseModel):
                 ignore_modules=[
                     transformer.x_pad_token,
                     transformer.cap_pad_token,
-                ]
+                ],
+                # Z-Image's unmanaged transformer pieces are tiny, and repeatedly
+                # moving them through torch's generic module.to() path has proven
+                # unstable on Windows with float8 offloading.
+                keep_unmanaged_on_device=True,
             )
 
         if self.model_config.low_vram:
@@ -326,7 +360,7 @@ class ZImageModel(BaseModel):
         text_embeddings: PromptEmbeds,
         **kwargs,
     ):
-        self.model.to(self.device_torch)
+        self._ensure_model_on_predict_device()
 
         latent_model_input = latent_model_input.unsqueeze(2)
         latent_model_input_list = list(latent_model_input.unbind(dim=0))
@@ -385,6 +419,31 @@ class ZImageModel(BaseModel):
 
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["layers"]
+
+    def get_quantization_exclude_modules(self) -> Optional[List[str]]:
+        # precision-sensitive modules kept in full precision (fnmatch patterns on
+        # module names within diffusers' ZImageTransformer2DModel). ~11.8M weights
+        # total, 0.19% of the transformer's quantizable weight, ~11 MiB of VRAM:
+        #   t_embedder*      - timestep embedder; its 256-dim output feeds every
+        #                      block's adaLN_modulation and the final layers, so
+        #                      error here is amplified across all 30 layers.
+        #                      diffusers itself lists this in
+        #                      _skip_layerwise_casting_patterns as precision sensitive
+        #   cap_embedder*    - the single caption-feature -> model-width projection
+        #                      (2560 -> 3840); also in _skip_layerwise_casting_patterns
+        #   all_x_embedder*  - patchified latent input projections
+        #   all_final_layer* - final adaLN-modulated output projections; error here
+        #                      lands straight on the prediction with nothing after it
+        #   siglip_embedder* - siglip feature projection; present only on the Omni /
+        #                      edit variants (matches nothing on Z-Image-De-Turbo,
+        #                      which has no siglip_feat_dim in its config)
+        return [
+            "t_embedder*",
+            "cap_embedder*",
+            "all_x_embedder*",
+            "all_final_layer*",
+            "siglip_embedder*",
+        ]
 
     def convert_lora_weights_before_save(self, state_dict):
         new_sd = {}

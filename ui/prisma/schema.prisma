@@ -32,8 +32,10 @@ model Job {
   stop            Boolean  @default(false)
   return_to_queue Boolean  @default(false) // same as stop, but will be set to 'queued' when stopped
   step            Int      @default(0)
+  total_steps     Int      @default(0) // runtime-resolved target (epochs + train-on-top); 0 = not yet reported
   info            String   @default("")
   speed_string    String   @default("")
+  cache_speed_string String @default("")
   queue_position  Int      @default(0)
 
   @@index([status])

@@ -3,44 +3,43 @@ import { NextRequest, NextResponse } from 'next/server';
 import fs from 'fs';
 import path from 'path';
 import { getDatasetsRoot, getTrainingFolder } from '@/server/settings';
+import { resolveInsideAllowedDir } from '@/server/safePath';
 
-export async function GET(request: NextRequest, { params }: { params: { filePath: string } }) {
-  const { filePath } = await params;
+export async function GET(request: NextRequest, context: { params: Promise<{ filePath: string[] }> }) {
+  const { filePath } = await context.params;
   try {
     // Decode the path
-    const decodedFilePath = decodeURIComponent(filePath);
+    const decodedFilePath = decodeURIComponent(filePath.join('/'));
 
     // Get allowed directories
     const datasetRoot = await getDatasetsRoot();
     const trainingRoot = await getTrainingFolder();
     const allowedDirs = [datasetRoot, trainingRoot];
 
-    // Security check: Ensure path is in allowed directory
-    const isAllowed =
-      allowedDirs.some(allowedDir => decodedFilePath.startsWith(allowedDir)) && !decodedFilePath.includes('..');
-
-    if (!isAllowed) {
+    // Security check: resolve and ensure the path is genuinely inside an allowed dir
+    const safePath = resolveInsideAllowedDir(decodedFilePath, allowedDirs);
+    if (!safePath) {
       console.warn(`Access denied: ${decodedFilePath} not in ${allowedDirs.join(', ')}`);
       return new NextResponse('Access denied', { status: 403 });
     }
 
     // Check if file exists
-    if (!fs.existsSync(decodedFilePath)) {
-      console.warn(`File not found: ${decodedFilePath}`);
+    if (!fs.existsSync(safePath)) {
+      console.warn(`File not found: ${safePath}`);
       return new NextResponse('File not found', { status: 404 });
     }
 
     // Get file info
-    const stat = fs.statSync(decodedFilePath);
+    const stat = fs.statSync(safePath);
     if (!stat.isFile()) {
       return new NextResponse('Not a file', { status: 400 });
     }
 
     // Get filename for Content-Disposition
-    const filename = path.basename(decodedFilePath);
+    const filename = path.basename(safePath);
 
     // Determine content type
-    const ext = path.extname(decodedFilePath).toLowerCase();
+    const ext = path.extname(safePath).toLowerCase();
     const contentTypeMap: { [key: string]: string } = {
       '.jpg': 'image/jpeg',
       '.jpeg': 'image/jpeg',
@@ -85,7 +84,7 @@ export async function GET(request: NextRequest, { params }: { params: { filePath
       const end = parts[1] ? parseInt(parts[1], 10) : Math.min(start + 10 * 1024 * 1024, stat.size - 1); // 10MB chunks
       const chunkSize = end - start + 1;
 
-      const fileStream = fs.createReadStream(decodedFilePath, {
+      const fileStream = fs.createReadStream(safePath, {
         start,
         end,
         highWaterMark: 64 * 1024, // 64KB buffer
@@ -101,7 +100,7 @@ export async function GET(request: NextRequest, { params }: { params: { filePath
       });
     } else {
       // For full file download, read directly without streaming wrapper
-      const fileStream = fs.createReadStream(decodedFilePath, {
+      const fileStream = fs.createReadStream(safePath, {
         highWaterMark: 64 * 1024, // 64KB buffer
       });
 

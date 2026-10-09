@@ -10,9 +10,9 @@ import { TopBar, MainContent } from '@/components/layout';
 import { apiClient } from '@/utils/api';
 import FullscreenDropOverlay from '@/components/FullscreenDropOverlay';
 
-export default function DatasetPage({ params }: { params: { datasetName: string } }) {
+export default function DatasetPage({ params }: { params: Promise<{ datasetName: string }> }) {
   const [imgList, setImgList] = useState<{ img_path: string }[]>([]);
-  const usableParams = use(params as any) as { datasetName: string };
+  const usableParams = use(params);
   const datasetName = usableParams.datasetName;
   const [status, setStatus] = useState<'idle' | 'loading' | 'success' | 'error'>('idle');
 

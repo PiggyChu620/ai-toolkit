@@ -1,8 +1,17 @@
 import os
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+# CUDA caching-allocator tuning, set before anything imports torch. On a 16 GB card
+# with layer offloading, the training OOMs were fragmentation: a 288 MiB request
+# failed while 2.31 GiB sat reserved but unusable. PyTorch's usual fix,
+# expandable_segments, is not supported on Windows; max_split_size_mb is. It stops
+# small allocations from carving up large cached blocks, so big free blocks stay whole
+# and can be reused -- or released and re-allocated -- when a large request would
+# otherwise fail. setdefault: an explicitly set PYTORCH_CUDA_ALLOC_CONF always wins.
+if os.name == "nt":
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256")
 import sys
-from typing import Union, OrderedDict
+from typing import Union
 from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
@@ -89,8 +98,21 @@ def main():
 
     if accelerator.is_main_process:
         print_acc(f"Running {len(config_file_list)} job{'' if len(config_file_list) == 1 else 's'}")
+        print_acc(f"CUDA allocator: PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF') or '(default)'}")
+    if os.name == "nt":
+        # Before any DataLoader worker exists: every child process joins this job and
+        # is killed by Windows when the trainer ends, however it ends (see the module).
+        from toolkit.windows_job import kill_children_with_this_process
+        status = kill_children_with_this_process()
+        if accelerator.is_main_process:
+            print_acc(f"Child processes (data-loader workers) end with the trainer: {status}")
+    if accelerator.is_main_process:
+        # workers orphaned by earlier jobs (e.g. from before the job object existed)
+        from toolkit.memory_management.cleanup import kill_orphaned_workers
+        kill_orphaned_workers(printer=print_acc)
 
     for config_file in config_file_list:
+        job = None
         try:
             job = get_job(config_file, args.name)
             job.run()
@@ -100,20 +122,32 @@ def main():
             print_acc(f"Error running job: {e}")
             jobs_failed += 1
             try:
-                job.process[0].on_error(e)
+                if job is not None:
+                    job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
-                raise e
+                raise
         except KeyboardInterrupt as e:
             try:
-                job.process[0].on_error(e)
+                if job is not None:
+                    job.process[0].on_error(e)
             except Exception as e2:
                 print_acc(f"Error running on_error: {e2}")
             if not args.recover:
                 print_end_message(jobs_completed, jobs_failed)
-                raise e
+                raise
+        finally:
+            # Whether the job finished or failed, the next config in this process starts
+            # a fresh pinned arena; old slabs are freed once the finished job's model (the
+            # last users of their views) is gone.
+            job = None
+            try:
+                from toolkit.memory_management import reset_pinned_arena
+                reset_pinned_arena()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

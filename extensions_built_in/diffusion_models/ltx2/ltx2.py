@@ -199,6 +199,9 @@ class LTX2Model(BaseModel):
     ltx_version = "2.0"
     ltx_te_path = None
 
+    def uses_i2v_first_frame_latents(self) -> bool:
+        return True
+
     def __init__(
         self,
         device,

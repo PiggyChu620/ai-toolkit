@@ -180,6 +180,9 @@ class ReferenceAdapter(torch.nn.Module):
         self._reference_images = None
         self._reference_latents = None
         self.has_memory = False
+        self._original_unet_forward = None
+        self._forward_wrapper = None
+        self._original_attn_processors = OrderedDict(sd.unet.attn_processors)
 
         self.noise_scheduler: Union[DDPMScheduler, EulerDiscreteScheduler] = None
 
@@ -282,11 +285,47 @@ class ReferenceAdapter(torch.nn.Module):
 
     def attach(self):
         unet = self.sd_ref().unet
-        self._original_unet_forward = unet.forward
-        unet.forward = lambda *args, **kwargs: self.unet_forward(*args, **kwargs)
+        if self._forward_wrapper is not None and unet.forward is self._forward_wrapper:
+            return
+
+        original_forward = unet.forward
+        self_ref = weakref.ref(self)
+
+        def forward_wrapper(*args, **kwargs):
+            adapter = self_ref()
+            if adapter is None:
+                return original_forward(*args, **kwargs)
+            return adapter.unet_forward(*args, **kwargs)
+
+        self._original_unet_forward = original_forward
+        self._forward_wrapper = forward_wrapper
+        unet.forward = forward_wrapper
         if self.sd_ref().network is not None:
             # set network to not merge in
             self.sd_ref().network.can_merge_in = False
+
+    def detach(self):
+        self.clear_memory()
+        self._reference_images = None
+        self._reference_latents = None
+
+        unet = self.unet_ref() if getattr(self, 'unet_ref', None) is not None else None
+        if (
+            unet is not None and
+            self._forward_wrapper is not None and
+            unet.forward is self._forward_wrapper and
+            self._original_unet_forward is not None
+        ):
+            unet.forward = self._original_unet_forward
+        if unet is not None and self._original_attn_processors is not None:
+            unet.set_attn_processor(self._original_attn_processors)
+
+        sd = self.sd_ref()
+        if sd is not None and getattr(sd, 'adapter', None) is self:
+            sd.adapter = None
+
+        self._forward_wrapper = None
+        self._original_unet_forward = None
 
     def unet_forward(self, sample, timestep, encoder_hidden_states, *args, **kwargs):
         skip = False

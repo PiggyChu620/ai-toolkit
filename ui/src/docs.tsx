@@ -52,6 +52,31 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'network.pretrained_lora_path': {
+    title: 'Load LoRA',
+    description: (
+      <>
+        Optional path to an existing LoRA checkpoint to use as the starting weights for the new trainable LoRA.
+        <br />
+        <br />
+        This copies the imported LoRA weights into the new adapter before training starts. It does not merge the LoRA
+        into the base model, and by default it does not import the old run&apos;s optimizer moments or step counter.
+      </>
+    ),
+  },
+  'network.resume_training_state': {
+    title: 'Resume Imported Training State',
+    description: (
+      <>
+        When enabled, and the loaded LoRA comes from a local AI-Toolkit training folder, the trainer will also try to
+        import the saved training step metadata and <code>optimizer.pt</code> from that same folder.
+        <br />
+        <br />
+        Use this when you want a new job to continue where an older run left off. Leave it off when you only want to
+        reuse the LoRA weights as initialization and start a fresh training schedule.
+      </>
+    ),
+  },
   'datasets.control_path': {
     title: 'Control Dataset',
     description: (
@@ -174,6 +199,83 @@ const docs: { [key: string]: ConfigDoc } = {
       </>
     ),
   },
+  'dataset.lazy_cache_text_embeddings': {
+    title: 'Lazy Cache Text Embeddings',
+    description: (
+      <>
+        Writes text embeddings to disk the first time a sample is actually used instead of precaching the whole dataset
+        before training starts.
+        <br />
+        <br />
+        This improves time-to-first-step on large datasets or short exploratory runs. While lazy text caching is active,
+        the text encoder stays loaded so the trainer can compute cache misses on demand.
+      </>
+    ),
+  },
+  'dataset.text_embedding_cache_shard_size': {
+    title: 'Text Cache Shard Size',
+    description: (
+      <>
+        Stores multiple cached text embeddings in each shard file instead of one <code>.safetensors</code> file per
+        image.
+        <br />
+        <br />
+        Larger shard sizes reduce filesystem overhead and can speed up cached training on Windows or large datasets. Set
+        this to <code>1</code> to keep the legacy one-file-per-image cache layout.
+      </>
+    ),
+  },
+  'dataset.caches_only': {
+    title: 'Train from Caches Only',
+    description: (
+      <>
+        Trains directly from the disk caches built by a previous run, without requiring the source images or caption{' '}
+        <code>.txt</code> files to still exist.
+        <br />
+        <br />
+        Image dimensions and cache keys are recovered from the dataset size database (<code>.aitk_size.json</code>), so
+        run the dataset once normally (with <em>Cache Latents to Disk</em> enabled) before deleting the source files.
+        Items whose cached latent cannot be found are skipped instead of re-encoded. Enabling this also enables{' '}
+        <em>Cache Latents to Disk</em>.
+      </>
+    ),
+  },
+  'dataset.cache_dir_override': {
+    title: 'Cache Directory Override',
+    description: (
+      <>
+        Stores dataset caches under a different root directory instead of next to the source images.
+        <br />
+        <br />
+        This is useful when your raw dataset lives on a slower drive but you want cached latents, cached text
+        embeddings, CLIP vision cache files, and the dataset size database to prefer a faster NVMe path.
+      </>
+    ),
+  },
+  'dataset.cache_dir_override_min_free_gb': {
+    title: 'Override Min Free GB',
+    description: (
+      <>
+        Minimum free space required on the override drive before new cache files are written there.
+        <br />
+        <br />
+        If the override drive falls below this threshold, new cache writes automatically fall back to the default
+        dataset-local cache folders. Existing cache reads still check both locations.
+      </>
+    ),
+  },
+  'process.cleanup_caches_on_startup': {
+    title: 'Clean All Caches on Startup',
+    description: (
+      <>
+        Deletes the trainer's persistent dataset caches before the job starts.
+        <br />
+        <br />
+        This clears cached latents, cached text embeddings, cached CLIP vision embeddings, and the dataset size cache.
+        Use it when cached data has become stale, corrupted, or you want a completely fresh preprocessing pass.
+      </>
+    ),
+  },
   'model.multistage': {
     title: 'Stages to Train',
     description: (
@@ -242,6 +344,33 @@ const docs: { [key: string]: ConfigDoc } = {
         <br />
         You can also select the percentage of the layers to offload. It is generally best to offload as few as possible
         (close to 0%) for best performance, but you can offload more if you need the memory.
+      </>
+    ),
+  },
+  'model.auto_layer_offloading_percent': {
+    title: 'Auto Offload %',
+    description: (
+      <>
+        When enabled, the trainer chooses the Transformer and Text Encoder offload percentages automatically from the
+        free VRAM available on the selected GPU when the job starts.
+        <br />
+        <br />
+        This is a runtime heuristic, not a fixed preset. If there is plenty of free VRAM, the trainer will offload very
+        little or nothing. If VRAM is tight, it will offload more aggressively.
+      </>
+    ),
+  },
+  'model.auto_low_vram': {
+    title: 'Auto Low VRAM',
+    description: (
+      <>
+        When enabled, the trainer decides whether to use Low VRAM mode from the free VRAM available on the selected
+        GPU when the job starts.
+        <br />
+        <br />
+        This is a startup heuristic, not a live toggle. If there is plenty of free VRAM, Low VRAM will stay off for
+        better performance. If VRAM is tight, Low VRAM will be enabled automatically. If the VRAM query fails, the
+        manual Low VRAM checkbox is used as the fallback.
       </>
     ),
   },

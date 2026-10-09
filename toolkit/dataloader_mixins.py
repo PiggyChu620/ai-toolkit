@@ -1,17 +1,22 @@
 import base64
+import gc
 import glob
 import hashlib
 import json
 import math
 import os
 import random
-from collections import OrderedDict
+import threading
+import time
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, List, Dict, Union
 import traceback
 
 import cv2
 import numpy as np
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, SiglipImageProcessor
@@ -19,18 +24,34 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection, Sigl
 from toolkit.audio.preserve_pitch import time_stretch_preserve_pitch
 from toolkit.basic import flush, value_map
 from toolkit.buckets import get_bucket_for_image_size, get_resolution
+from toolkit.cache_paths import get_cache_dir_candidates, get_cache_file_candidates
 from toolkit.config_modules import ControlTypes
 from toolkit.control_generator import ControlGenerator
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.pixtral_vision import PixtralVisionImagePreprocessorCompatible
-from toolkit.prompt_utils import inject_trigger_into_prompt
+from toolkit.latent_cache_runtime import (
+    has_pending_latent_state,
+    load_latent_index_manifest,
+    load_pending_latent_state,
+    lookup_latent_index_entry,
+    remove_pending_latent_states,
+    rewrite_latent_index_manifest,
+    upsert_pending_latent_states,
+    update_latent_index_entries,
+)
+from toolkit.advanced_prompt_embeds import AdvancedPromptEmbeds
+from toolkit.prompt_utils import (
+    PromptEmbeds,
+    concat_prompt_embeds,
+    inject_trigger_into_prompt,
+    split_prompt_embeds,
+)
 from torchvision import transforms
 from PIL import Image, ImageFilter, ImageOps
 from PIL.ImageOps import exif_transpose
 import albumentations as A
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
-from toolkit.prompt_utils import PromptEmbeds
 from torchvision.transforms import functional as TF
 
 from toolkit.train_tools import get_torch_dtype
@@ -67,6 +88,1127 @@ transforms_dict = {
 }
 
 img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
+
+LATENT_CACHE_SHARD_MANIFEST_NAME = "_latent_shards.json"
+LATENT_CACHE_SHARD_VERSION = 1
+LATENT_CACHE_SHARD_KEY_SEP = "__"
+LATENT_AUX_TENSOR_KEYS = (
+    "first_frame_latent",
+    "audio_latent",
+    "first_frame_condition",
+)
+latent_shard_manifest_cache = {}
+_legacy_latent_manifest_migrated = set()
+
+
+def _maybe_migrate_legacy_latent_manifest(latent_dir: str):
+    """One-shot legacy-JSON-manifest probe for a latent dir; None afterwards.
+
+    Callers reach here only when the indexed SQLite point lookup MISSED. The old
+    fallback then called load_latent_shard_manifest(), which runs an unbounded
+    `SELECT cache_key, shard, key_prefix FROM entries` and materialises every row
+    into a dict -- to look up the same key the point lookup just failed to find,
+    so it could never succeed. With a 116k-image dataset that is a full-table scan
+    per miss, in every worker and again in the training thread, growing linearly
+    with cache size.
+
+    The JSON manifest only exists for pre-SQLite caches, and load_latent_shard_manifest
+    migrates it into SQLite on first read, so one attempt per latent_dir per process is
+    enough. Gating on "does the DB file exist yet" instead would be wrong: another
+    writer can create the DB first and permanently strand a legacy JSON cache.
+    """
+    if latent_dir in _legacy_latent_manifest_migrated:
+        return None
+    _legacy_latent_manifest_migrated.add(latent_dir)
+    return load_latent_shard_manifest(latent_dir)
+lazy_latent_shard_buffer_lock = threading.Lock()
+lazy_latent_shard_buffers = {}
+lazy_latent_shard_sizes = {}
+lazy_latent_manifest_buffers = {}
+
+TEXT_EMBED_CACHE_SHARD_MANIFEST_NAME = "_text_embedding_shards.json"
+TEXT_EMBED_CACHE_SHARD_VERSION = 1
+TEXT_EMBED_CACHE_SHARD_KEY_SEP = "__"
+text_embed_shard_manifest_cache = {}
+
+MANIFEST_IO_RETRIES = 12
+MANIFEST_IO_RETRY_DELAY = 0.05
+
+
+def get_latent_shard_manifest_path(latent_dir: str) -> str:
+    return os.path.join(latent_dir, LATENT_CACHE_SHARD_MANIFEST_NAME)
+
+
+def get_latent_shard_bucket_key(file_item: 'FileItemDTO') -> str:
+    return f"{file_item.crop_width}x{file_item.crop_height}"
+
+
+def get_latent_shard_tensor_key(key_prefix: str, tensor_name: str) -> str:
+    return f"{key_prefix}{LATENT_CACHE_SHARD_KEY_SEP}{tensor_name}"
+
+
+def ensure_pending_latent_session_id() -> str:
+    return "sqlite-pending-cache"
+
+
+def _load_json_manifest_with_cache(manifest_path: str, cache_store: dict, expected_version: int):
+    cached = cache_store.get(manifest_path)
+    last_error = None
+
+    def load_manifest_file(path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            loaded_manifest = json.load(f)
+        if loaded_manifest.get("version") != expected_version:
+            return None
+        return loaded_manifest
+
+    for attempt in range(MANIFEST_IO_RETRIES):
+        try:
+            if not os.path.exists(manifest_path):
+                cache_store.pop(manifest_path, None)
+                return None
+
+            stat = os.stat(manifest_path)
+            cached = cache_store.get(manifest_path)
+            if cached is not None:
+                if cached["mtime_ns"] == stat.st_mtime_ns and cached["size"] == stat.st_size:
+                    return cached["manifest"]
+
+            manifest = load_manifest_file(manifest_path)
+            if manifest is None:
+                return None
+
+            cache_store[manifest_path] = {
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+                "manifest": manifest,
+            }
+            return manifest
+        except FileNotFoundError:
+            return None
+        except (PermissionError, json.JSONDecodeError, OSError) as e:
+            last_error = e
+            if attempt < MANIFEST_IO_RETRIES - 1:
+                time.sleep(MANIFEST_IO_RETRY_DELAY)
+                continue
+
+    if cached is not None:
+        return cached["manifest"]
+    backup_path = f"{manifest_path}.bak"
+    if os.path.exists(backup_path):
+        try:
+            manifest = load_manifest_file(backup_path)
+            if manifest is not None:
+                stat = os.stat(manifest_path) if os.path.exists(manifest_path) else os.stat(backup_path)
+                cache_store[manifest_path] = {
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "manifest": manifest,
+                }
+                return manifest
+        except (PermissionError, json.JSONDecodeError, OSError):
+            pass
+    if isinstance(last_error, PermissionError):
+        return None
+    return None
+
+
+def _save_json_manifest_with_cache(manifest_path: str, manifest: dict, cache_store: dict):
+    manifest_dir = os.path.dirname(manifest_path)
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+    temp_path = (
+        f"{manifest_path}."
+        f"{os.getpid()}."
+        f"{threading.get_ident()}."
+        f"{time.time_ns()}.tmp"
+    )
+    last_error = None
+    try:
+        for attempt in range(MANIFEST_IO_RETRIES):
+            try:
+                fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+                try:
+                    offset = 0
+                    while offset < len(manifest_bytes):
+                        offset += os.write(fd, manifest_bytes[offset:])
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                temp_stat = os.stat(temp_path)
+                if temp_stat.st_size != len(manifest_bytes):
+                    raise OSError(
+                        f"incomplete manifest write: {temp_stat.st_size} != {len(manifest_bytes)}"
+                    )
+                with open(temp_path, "rb") as f:
+                    first_byte = f.read(1)
+                    f.seek(-1, os.SEEK_END)
+                    last_byte = f.read(1)
+                if first_byte != b"{" or last_byte != b"}":
+                    raise OSError("manifest write failed sanity check")
+                os.replace(temp_path, manifest_path)
+                backup_path = f"{manifest_path}.bak"
+                backup_temp_path = (
+                    f"{backup_path}."
+                    f"{os.getpid()}."
+                    f"{threading.get_ident()}."
+                    f"{time.time_ns()}.tmp"
+                )
+                backup_fd = os.open(backup_temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o666)
+                try:
+                    offset = 0
+                    while offset < len(manifest_bytes):
+                        offset += os.write(backup_fd, manifest_bytes[offset:])
+                    os.fsync(backup_fd)
+                finally:
+                    os.close(backup_fd)
+                os.replace(backup_temp_path, backup_path)
+                stat = os.stat(manifest_path)
+                cache_store[manifest_path] = {
+                    "mtime_ns": stat.st_mtime_ns,
+                    "size": stat.st_size,
+                    "manifest": manifest,
+                }
+                return
+            except (PermissionError, json.JSONDecodeError, OSError) as e:
+                last_error = e
+                for cleanup_path in (temp_path, locals().get("backup_temp_path")):
+                    if cleanup_path and os.path.exists(cleanup_path):
+                        try:
+                            os.remove(cleanup_path)
+                        except OSError:
+                            pass
+                if attempt < MANIFEST_IO_RETRIES - 1:
+                    time.sleep(MANIFEST_IO_RETRY_DELAY)
+                    continue
+                raise
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    if last_error is not None:
+        raise last_error
+
+
+def load_latent_shard_manifest(latent_dir: str):
+    manifest = load_latent_index_manifest(latent_dir)
+    if manifest is not None:
+        return manifest
+
+    manifest_path = get_latent_shard_manifest_path(latent_dir)
+    manifest = _load_json_manifest_with_cache(
+        manifest_path,
+        latent_shard_manifest_cache,
+        LATENT_CACHE_SHARD_VERSION,
+    )
+    if manifest is not None:
+        rewrite_latent_index_manifest(latent_dir, manifest)
+    return manifest
+
+
+def save_latent_shard_manifest(latent_dir: str, manifest: dict):
+    rewrite_latent_index_manifest(latent_dir, manifest)
+
+
+def save_latent_shard_manifest_meta(latent_dir: str, manifest: dict):
+    update_latent_index_entries(
+        latent_dir,
+        [],
+        version=manifest.get("version", LATENT_CACHE_SHARD_VERSION),
+        shard_size=manifest.get("shard_size"),
+        next_shard_index=manifest.get("next_shard_index"),
+    )
+
+
+def infer_next_latent_shard_index(manifest: dict) -> int:
+    max_index = -1
+    for entry in manifest.get("items", {}).values():
+        shard_name = entry.get("shard", "")
+        shard_root, shard_ext = os.path.splitext(shard_name)
+        if shard_ext != ".safetensors":
+            continue
+        try:
+            max_index = max(max_index, int(shard_root.rsplit("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max_index + 1
+
+
+def get_or_create_latent_shard_manifest(latent_dir: str, shard_size: int) -> dict:
+    manifest = load_latent_shard_manifest(latent_dir)
+    if manifest is None:
+        return {
+            "version": LATENT_CACHE_SHARD_VERSION,
+            "shard_size": shard_size,
+            "next_shard_index": 0,
+            "items": {},
+        }
+
+    manifest["version"] = LATENT_CACHE_SHARD_VERSION
+    manifest["shard_size"] = shard_size
+    manifest.setdefault("items", {})
+    if "next_shard_index" not in manifest:
+        manifest["next_shard_index"] = infer_next_latent_shard_index(manifest)
+    return manifest
+
+
+def build_latent_shard_storage_entry(latent_dir: str, shard_name: str, key_prefix: str):
+    return {
+        "storage": "shard",
+        "path": os.path.join(latent_dir, shard_name),
+        "shard": shard_name,
+        "key_prefix": key_prefix,
+    }
+
+
+def build_buffered_latent_storage_entry(latent_dir: str, key_prefix: str):
+    return {
+        "storage": "buffered",
+        "latent_dir": latent_dir,
+        "key_prefix": key_prefix,
+    }
+
+
+def get_bucket_key_from_latent_shard_name(shard_name: str):
+    if not shard_name.endswith(".safetensors") or not shard_name.startswith("bucket_"):
+        return None
+    shard_root = shard_name[:-len(".safetensors")]
+    bucket_key, sep, shard_index = shard_root[len("bucket_"):].rpartition("_")
+    if sep == "" or not shard_index.isdigit() or bucket_key == "":
+        return None
+    return bucket_key
+
+
+def _atomic_save_file(state_dict, path, metadata=None):
+    # Write to a temp file in the same directory, then atomically os.replace() it
+    # into place. A crash/BSOD mid-write then leaves only a stray .tmp file rather
+    # than a truncated/corrupt cache file that would wedge every item in the shard.
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    try:
+        if metadata is not None:
+            save_file(state_dict, tmp_path, metadata=metadata)
+        else:
+            save_file(state_dict, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _save_legacy_latent_cache_file(file_item: 'FileItemDTO', state_dict: OrderedDict):
+    latent_path = file_item.get_latent_path(recalculate=True)
+    meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+    os.makedirs(os.path.dirname(latent_path), exist_ok=True)
+    _atomic_save_file(state_dict, latent_path, metadata=meta)
+    file_item.set_latent_storage_entry({
+        "storage": "legacy",
+        "path": latent_path,
+    })
+    file_item.is_latent_cached = True
+
+
+def _write_latent_shard_entries(
+        latent_dir: str,
+        bucket_key: str,
+        shard_entries: List[tuple],
+        manifest: dict,
+):
+    if len(shard_entries) == 0:
+        return None
+
+    shard_index = manifest.get("next_shard_index", 0)
+    shard_name = f"bucket_{bucket_key}_{shard_index:05d}.safetensors"
+    shard_path = os.path.join(latent_dir, shard_name)
+
+    shard_state_dict = OrderedDict()
+    for key_prefix, state_dict, _ in shard_entries:
+        shard_state_dict[
+            get_latent_shard_tensor_key(key_prefix, "latent")
+        ] = state_dict["latent"]
+        for tensor_name in LATENT_AUX_TENSOR_KEYS:
+            if tensor_name in state_dict:
+                shard_state_dict[
+                    get_latent_shard_tensor_key(key_prefix, tensor_name)
+                ] = state_dict[tensor_name]
+
+    shard_meta = get_meta_for_safetensors(
+        OrderedDict([
+            ("latent_cache_shard_version", LATENT_CACHE_SHARD_VERSION),
+            ("bucket", bucket_key),
+            ("items", len(shard_entries)),
+        ])
+    )
+    os.makedirs(latent_dir, exist_ok=True)
+    _atomic_save_file(shard_state_dict, shard_path, metadata=shard_meta)
+
+    index_entries = []
+    for key_prefix, _, file_item in shard_entries:
+        manifest["items"][key_prefix] = {
+            "shard": shard_name,
+            "key_prefix": key_prefix,
+        }
+        index_entries.append((key_prefix, shard_name, key_prefix))
+        if file_item is not None:
+            file_item.set_latent_storage_entry(
+                build_latent_shard_storage_entry(latent_dir, shard_name, key_prefix)
+            )
+            file_item.is_latent_cached = True
+
+    manifest["next_shard_index"] = shard_index + 1
+    update_latent_index_entries(
+        latent_dir,
+        index_entries,
+        version=manifest.get("version", LATENT_CACHE_SHARD_VERSION),
+        shard_size=manifest.get("shard_size"),
+        next_shard_index=manifest.get("next_shard_index"),
+    )
+    return shard_name
+
+
+def _write_latent_shard_pairs(
+        latent_dir: str,
+        bucket_key: str,
+        shard_pairs: List[tuple],
+        manifest: dict,
+):
+    shard_entries = [
+        (file_item.get_latent_cache_key(), state_dict, file_item)
+        for file_item, state_dict in shard_pairs
+    ]
+    return _write_latent_shard_entries(latent_dir, bucket_key, shard_entries, manifest)
+
+
+def flush_buffered_file_item_latents_to_disk(force=False):
+    dirty_manifests = {}
+    with lazy_latent_shard_buffer_lock:
+        for buffer_key in list(lazy_latent_shard_buffers.keys()):
+            pending_map = lazy_latent_shard_buffers.get(buffer_key)
+            if not pending_map:
+                continue
+
+            latent_dir, bucket_key = buffer_key
+            shard_size = max(1, lazy_latent_shard_sizes.get(buffer_key, 1))
+            manifest = lazy_latent_manifest_buffers.get(latent_dir)
+            if manifest is None:
+                manifest = get_or_create_latent_shard_manifest(latent_dir, shard_size)
+                lazy_latent_manifest_buffers[latent_dir] = manifest
+
+            while len(pending_map) >= shard_size or (force and len(pending_map) > 0):
+                item_count = shard_size if len(pending_map) >= shard_size else len(pending_map)
+                shard_pairs = []
+                removed_key_prefixes = []
+                for _ in range(item_count):
+                    key_prefix, pair = pending_map.popitem(last=False)
+                    removed_key_prefixes.append(key_prefix)
+                    shard_pairs.append(pair)
+                _write_latent_shard_pairs(latent_dir, bucket_key, shard_pairs, manifest)
+                remove_pending_latent_states(latent_dir, removed_key_prefixes)
+                dirty_manifests[latent_dir] = manifest
+
+            if len(pending_map) == 0:
+                lazy_latent_shard_buffers.pop(buffer_key, None)
+                lazy_latent_shard_sizes.pop(buffer_key, None)
+
+        for latent_dir, manifest in dirty_manifests.items():
+            save_latent_shard_manifest_meta(latent_dir, manifest)
+
+
+def get_buffered_file_item_latent_count() -> int:
+    with lazy_latent_shard_buffer_lock:
+        return sum(len(pending_map) for pending_map in lazy_latent_shard_buffers.values())
+
+
+def clear_buffered_file_item_latents_to_disk():
+    with lazy_latent_shard_buffer_lock:
+        lazy_latent_shard_buffers.clear()
+        lazy_latent_shard_sizes.clear()
+        lazy_latent_manifest_buffers.clear()
+
+
+def _best_effort_remove_shard(path: str) -> bool:
+    # On Windows, safetensors safe_open mmaps the shard and the OS won't release the
+    # file handle until the mapping is garbage-collected, so a just-read shard can hit
+    # PermissionError (WinError 5) on os.remove. Drop lingering refs via gc and retry;
+    # if it's still locked (another process / AV scan), give up and leave a harmless
+    # orphan rather than crashing startup (the manifest no longer references it).
+    for attempt in range(4):
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except (PermissionError, OSError):
+            gc.collect()
+            if attempt < 3:
+                time.sleep(0.1 * (attempt + 1))
+    return False
+
+
+def compact_latent_shards(latent_dir: str, shard_size: int):
+    shard_size = max(1, shard_size)
+    if shard_size <= 1 or not os.path.isdir(latent_dir):
+        return {
+            "compacted": False,
+            "moved_items": 0,
+            "removed_shards": 0,
+            "created_shards": 0,
+        }
+
+    manifest = load_latent_shard_manifest(latent_dir)
+    if manifest is None:
+        return {
+            "compacted": False,
+            "moved_items": 0,
+            "removed_shards": 0,
+            "created_shards": 0,
+        }
+
+    manifest["version"] = LATENT_CACHE_SHARD_VERSION
+    manifest["shard_size"] = shard_size
+    manifest.setdefault("items", {})
+    manifest.setdefault("next_shard_index", infer_next_latent_shard_index(manifest))
+
+    bucket_entries = {}
+    shard_counts = {}
+    for cache_key, shard_entry in manifest.get("items", {}).items():
+        shard_name = shard_entry.get("shard")
+        if not shard_name:
+            continue
+        bucket_key = get_bucket_key_from_latent_shard_name(shard_name)
+        if bucket_key is None:
+            continue
+        key_prefix = shard_entry.get("key_prefix", cache_key)
+        bucket_entries.setdefault(bucket_key, {}).setdefault(shard_name, []).append(
+            (cache_key, key_prefix)
+        )
+        shard_counts[shard_name] = shard_counts.get(shard_name, 0) + 1
+
+    moved_items = 0
+    removed_shards = 0
+    created_shards = 0
+    did_compact = False
+
+    bucket_items = bucket_entries.items()
+    # A fragmented cache (many underfilled shards left by crash-interrupted caching)
+    # can take minutes to rewrite. Show a progress bar so this one-time work doesn't
+    # look like a hang (it otherwise runs silently).
+    if len(bucket_entries) > 1:
+        bucket_items = tqdm(
+            bucket_items,
+            total=len(bucket_entries),
+            desc=f"Compacting latent cache {latent_dir}",
+            unit="bucket",
+        )
+    for bucket_key, entries_by_shard in bucket_items:
+        partial_shards = [
+            shard_name
+            for shard_name, shard_entries in entries_by_shard.items()
+            if 0 < len(shard_entries) < shard_size and os.path.exists(os.path.join(latent_dir, shard_name))
+        ]
+        if len(partial_shards) <= 1:
+            continue
+
+        total_partial_items = sum(len(entries_by_shard[shard_name]) for shard_name in partial_shards)
+        if len(partial_shards) <= math.ceil(total_partial_items / shard_size):
+            continue
+
+        compact_buffer = []
+        created_for_bucket = 0
+
+        for shard_name in partial_shards:
+            shard_path = os.path.join(latent_dir, shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as shard_file:
+                available_keys = set(shard_file.keys())
+                for cache_key, key_prefix in entries_by_shard[shard_name]:
+                    latent_key = get_latent_shard_tensor_key(key_prefix, "latent")
+                    if latent_key not in available_keys:
+                        continue
+                    state_dict = OrderedDict([
+                        ("latent", shard_file.get_tensor(latent_key)),
+                    ])
+                    for tensor_name in LATENT_AUX_TENSOR_KEYS:
+                        tensor_key = get_latent_shard_tensor_key(key_prefix, tensor_name)
+                        if tensor_key in available_keys:
+                            state_dict[tensor_name] = shard_file.get_tensor(tensor_key)
+                    compact_buffer.append((key_prefix, state_dict, None))
+
+                    if len(compact_buffer) >= shard_size:
+                        _write_latent_shard_entries(latent_dir, bucket_key, compact_buffer, manifest)
+                        created_for_bucket += 1
+                        compact_buffer = []
+
+        if len(compact_buffer) > 0:
+            _write_latent_shard_entries(latent_dir, bucket_key, compact_buffer, manifest)
+            created_for_bucket += 1
+
+        save_latent_shard_manifest(latent_dir, manifest)
+
+        # Release the safe_open mmaps held by the read loop above so Windows lets us
+        # delete the just-read shards (a still-mapped shard -> os.remove WinError 5).
+        compact_buffer = []
+        try:
+            del shard_file
+        except NameError:
+            pass
+        gc.collect()
+
+        for shard_name in partial_shards:
+            shard_path = os.path.join(latent_dir, shard_name)
+            # One quick attempt only. A just-read shard can still be briefly locked
+            # (antivirus/indexer on the data drive, or mmap-release lag), and retrying
+            # every file here would stall startup. Don't warn — the end-of-run orphan
+            # sweep below deletes whatever's left once the locks clear, and anything
+            # still stuck is removed on the next startup.
+            try:
+                os.remove(shard_path)
+                removed_shards += 1
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+
+        moved_items += total_partial_items
+        created_shards += created_for_bucket
+        did_compact = True
+
+    if did_compact:
+        referenced_shards = {
+            shard_entry.get("shard")
+            for shard_entry in manifest.get("items", {}).values()
+            if shard_entry.get("shard")
+        }
+        stuck_orphans = 0
+        for file_name in os.listdir(latent_dir):
+            if not file_name.endswith(".safetensors") or not file_name.startswith("bucket_"):
+                continue
+            if file_name in referenced_shards:
+                continue
+            if not _best_effort_remove_shard(os.path.join(latent_dir, file_name)):
+                stuck_orphans += 1
+        if stuck_orphans:
+            print_acc(
+                f"Note: {stuck_orphans} superseded latent shard(s) in {latent_dir} are "
+                f"temporarily locked (antivirus/indexer); they'll be removed on the next startup."
+            )
+
+    return {
+        "compacted": did_compact,
+        "moved_items": moved_items,
+        "removed_shards": removed_shards,
+        "created_shards": created_shards,
+    }
+
+
+def get_text_embed_shard_manifest_path(te_dir: str) -> str:
+    return os.path.join(te_dir, TEXT_EMBED_CACHE_SHARD_MANIFEST_NAME)
+
+
+def load_text_embed_shard_manifest(te_dir: str):
+    manifest_path = get_text_embed_shard_manifest_path(te_dir)
+    return _load_json_manifest_with_cache(
+        manifest_path,
+        text_embed_shard_manifest_cache,
+        TEXT_EMBED_CACHE_SHARD_VERSION,
+    )
+
+
+def save_text_embed_shard_manifest(te_dir: str, manifest: dict):
+    manifest_path = get_text_embed_shard_manifest_path(te_dir)
+    _save_json_manifest_with_cache(
+        manifest_path,
+        manifest,
+        text_embed_shard_manifest_cache,
+    )
+
+
+def infer_next_text_embed_shard_index(manifest: dict) -> int:
+    max_index = -1
+    for entry in manifest.get("items", {}).values():
+        shard_name = entry.get("shard", "")
+        shard_root, shard_ext = os.path.splitext(shard_name)
+        if shard_ext != ".safetensors":
+            continue
+        try:
+            max_index = max(max_index, int(shard_root.rsplit("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return max_index + 1
+
+
+def rebuild_text_embed_shard_manifest_from_shards(te_dir: str, shard_size: int):
+    if not os.path.isdir(te_dir):
+        return None
+
+    manifest = {
+        "version": TEXT_EMBED_CACHE_SHARD_VERSION,
+        "shard_size": shard_size,
+        "next_shard_index": 0,
+        "items": {},
+    }
+    max_index = -1
+
+    for file_name in os.listdir(te_dir):
+        if not file_name.endswith(".safetensors") or not file_name.startswith("text_embeddings_"):
+            continue
+
+        shard_root, _ = os.path.splitext(file_name)
+        try:
+            max_index = max(max_index, int(shard_root.rsplit("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+
+        shard_path = os.path.join(te_dir, file_name)
+        try:
+            with safe_open(shard_path, framework="pt", device="cpu") as shard_file:
+                for key in shard_file.keys():
+                    key_prefix = key.split(TEXT_EMBED_CACHE_SHARD_KEY_SEP, 1)[0]
+                    if key_prefix:
+                        manifest["items"][key_prefix] = {
+                            "shard": file_name,
+                            "key_prefix": key_prefix,
+                        }
+        except (OSError, ValueError):
+            continue
+
+    manifest["next_shard_index"] = max_index + 1
+    if max_index < 0 and len(manifest["items"]) == 0:
+        return None
+    return manifest
+
+
+def get_or_create_text_embed_shard_manifest(te_dir: str, shard_size: int) -> dict:
+    manifest = load_text_embed_shard_manifest(te_dir)
+    if manifest is None:
+        rebuilt_manifest = rebuild_text_embed_shard_manifest_from_shards(te_dir, shard_size)
+        if rebuilt_manifest is not None:
+            return rebuilt_manifest
+        return {
+            "version": TEXT_EMBED_CACHE_SHARD_VERSION,
+            "shard_size": shard_size,
+            "next_shard_index": 0,
+            "items": {},
+        }
+
+    manifest["version"] = TEXT_EMBED_CACHE_SHARD_VERSION
+    manifest["shard_size"] = shard_size
+    manifest.setdefault("items", {})
+    if "next_shard_index" not in manifest:
+        manifest["next_shard_index"] = infer_next_text_embed_shard_index(manifest)
+    return manifest
+
+
+def build_text_embed_shard_storage_entry(te_dir: str, shard_name: str, key_prefix: str):
+    return {
+        "storage": "shard",
+        "path": os.path.join(te_dir, shard_name),
+        "shard": shard_name,
+        "key_prefix": key_prefix,
+    }
+
+
+def assign_latent_tensors(
+        file_item: 'FileItemDTO',
+        latent: torch.Tensor,
+        first_frame_latent: Union[torch.Tensor, None] = None,
+        audio_latent: Union[torch.Tensor, None] = None,
+        first_frame_condition: Union[torch.Tensor, None] = None,
+        dtype=None,
+):
+    target_dtype = dtype if dtype is not None else latent.dtype
+    file_item._encoded_latent = latent.to("cpu", dtype=target_dtype)
+    file_item._cached_first_frame_latent = None
+    file_item._cached_audio_latent = None
+    file_item._cached_first_frame_condition = None
+
+    if first_frame_latent is not None:
+        first_frame_dtype = dtype if dtype is not None else first_frame_latent.dtype
+        file_item._cached_first_frame_latent = first_frame_latent.to(
+            "cpu", dtype=first_frame_dtype
+        )
+
+    if audio_latent is not None:
+        audio_dtype = dtype if dtype is not None else audio_latent.dtype
+        file_item._cached_audio_latent = audio_latent.to("cpu", dtype=audio_dtype)
+
+    if first_frame_condition is not None:
+        condition_dtype = dtype if dtype is not None else first_frame_condition.dtype
+        file_item._cached_first_frame_condition = first_frame_condition.to(
+            "cpu", dtype=condition_dtype
+        )
+
+
+def hydrate_file_items_from_cached_latents(
+        file_items: List['FileItemDTO'],
+        dtype=None,
+):
+    shard_groups: Dict[str, List[tuple]] = {}
+
+    for file_item in file_items:
+        if not file_item.is_latent_cached or file_item._encoded_latent is not None:
+            continue
+
+        storage_entry = file_item.get_latent_storage_entry()
+        if storage_entry is None:
+            continue
+
+        if storage_entry["storage"] == "buffered":
+            buffer_key = (
+                storage_entry["latent_dir"],
+                get_latent_shard_bucket_key(file_item),
+            )
+            pending_map = lazy_latent_shard_buffers.get(buffer_key)
+            buffered_pair = None if pending_map is None else pending_map.get(storage_entry["key_prefix"])
+            if buffered_pair is None:
+                state_dict = load_pending_latent_state(
+                    storage_entry["latent_dir"],
+                    storage_entry["key_prefix"],
+                )
+                if state_dict is None:
+                    refreshed_storage_entry = file_item.get_latent_storage_entry(recalculate=True)
+                    if refreshed_storage_entry is None:
+                        continue
+                    if refreshed_storage_entry.get("storage") == "buffered":
+                        continue
+                    storage_entry = refreshed_storage_entry
+                else:
+                    assign_latent_tensors(
+                        file_item,
+                        state_dict["latent"],
+                        state_dict.get("first_frame_latent"),
+                        state_dict.get("audio_latent"),
+                        state_dict.get("first_frame_condition"),
+                        dtype=dtype,
+                    )
+                    continue
+
+            if storage_entry["storage"] == "buffered":
+                state_dict = buffered_pair[1]
+                assign_latent_tensors(
+                    file_item,
+                    state_dict["latent"],
+                    state_dict.get("first_frame_latent"),
+                    state_dict.get("audio_latent"),
+                    state_dict.get("first_frame_condition"),
+                    dtype=dtype,
+                )
+                continue
+
+        if storage_entry["storage"] == "legacy":
+            state_dict = load_file(storage_entry["path"], device="cpu")
+            assign_latent_tensors(
+                file_item,
+                state_dict["latent"],
+                state_dict.get("first_frame_latent"),
+                state_dict.get("audio_latent"),
+                state_dict.get("first_frame_condition"),
+                dtype=dtype,
+            )
+            continue
+
+        shard_groups.setdefault(storage_entry["path"], []).append(
+            (file_item, storage_entry["key_prefix"])
+        )
+
+    for shard_path, shard_items in shard_groups.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as shard_file:
+            available_keys = set(shard_file.keys())
+            for file_item, key_prefix in shard_items:
+                latent_key = get_latent_shard_tensor_key(key_prefix, "latent")
+                if latent_key not in available_keys:
+                    raise RuntimeError(
+                        f"Latent cache shard '{shard_path}' is missing key "
+                        f"'{latent_key}' (likely a truncated/corrupt shard). Delete "
+                        f"this shard and its '_latent_shards.sqlite3' index to re-cache."
+                    )
+                assign_latent_tensors(
+                    file_item,
+                    shard_file.get_tensor(latent_key),
+                    shard_file.get_tensor(
+                        get_latent_shard_tensor_key(key_prefix, "first_frame_latent")
+                    )
+                    if get_latent_shard_tensor_key(key_prefix, "first_frame_latent") in available_keys
+                    else None,
+                    shard_file.get_tensor(
+                        get_latent_shard_tensor_key(key_prefix, "audio_latent")
+                    )
+                    if get_latent_shard_tensor_key(key_prefix, "audio_latent") in available_keys
+                    else None,
+                    shard_file.get_tensor(
+                        get_latent_shard_tensor_key(key_prefix, "first_frame_condition")
+                    )
+                    if get_latent_shard_tensor_key(key_prefix, "first_frame_condition") in available_keys
+                    else None,
+                    dtype=dtype,
+                )
+
+
+def cache_file_item_latents_to_disk(
+        file_item_state_dict_pairs: List[tuple],
+        shard_size: int,
+        buffered: bool = False,
+):
+    if len(file_item_state_dict_pairs) == 0:
+        return
+
+    pending_pairs = []
+    for file_item, state_dict in file_item_state_dict_pairs:
+        storage_entry = file_item.get_latent_storage_entry(recalculate=True)
+        if storage_entry is not None:
+            file_item.is_latent_cached = True
+            continue
+        pending_pairs.append((file_item, state_dict))
+
+    if len(pending_pairs) == 0:
+        return
+
+    shard_size = max(1, shard_size)
+    if shard_size == 1:
+        for file_item, state_dict in pending_pairs:
+            _save_legacy_latent_cache_file(file_item, state_dict)
+        return
+
+    if buffered:
+        pending_entries = []
+        with lazy_latent_shard_buffer_lock:
+            for file_item, state_dict in pending_pairs:
+                latent_dir = file_item.get_latent_cache_dir()
+                bucket_key = get_latent_shard_bucket_key(file_item)
+                buffer_key = (latent_dir, bucket_key)
+                key_prefix = file_item.get_latent_cache_key()
+                pending_map = lazy_latent_shard_buffers.setdefault(buffer_key, OrderedDict())
+                pending_map[key_prefix] = (file_item, state_dict)
+                lazy_latent_shard_sizes[buffer_key] = shard_size
+                pending_entries.append((latent_dir, key_prefix, bucket_key, state_dict))
+                file_item.set_latent_storage_entry(
+                    build_buffered_latent_storage_entry(latent_dir, key_prefix)
+                )
+                file_item.is_latent_cached = True
+        entries_by_dir: Dict[str, List[tuple]] = {}
+        for latent_dir, key_prefix, bucket_key, state_dict in pending_entries:
+            entries_by_dir.setdefault(latent_dir, []).append((key_prefix, bucket_key, state_dict))
+        for latent_dir, entries in entries_by_dir.items():
+            upsert_pending_latent_states(latent_dir, entries)
+        flush_buffered_file_item_latents_to_disk(force=False)
+        return
+
+    grouped_pairs: Dict[tuple, List[tuple]] = {}
+    for file_item, state_dict in pending_pairs:
+        group_key = (
+            file_item.get_latent_cache_dir(),
+            get_latent_shard_bucket_key(file_item),
+        )
+        grouped_pairs.setdefault(group_key, []).append((file_item, state_dict))
+
+    manifests: Dict[str, dict] = {}
+    for (latent_dir, bucket_key), group in grouped_pairs.items():
+        manifest = manifests.get(latent_dir)
+        if manifest is None:
+            manifest = get_or_create_latent_shard_manifest(latent_dir, shard_size)
+            manifests[latent_dir] = manifest
+
+        for shard_start in range(0, len(group), shard_size):
+            shard_pairs = group[shard_start:shard_start + shard_size]
+            _write_latent_shard_pairs(latent_dir, bucket_key, shard_pairs, manifest)
+
+    for latent_dir, manifest in manifests.items():
+        save_latent_shard_manifest(latent_dir, manifest)
+
+
+def load_control_images_for_text_embedding(file_item: 'FileItemDTO', sd: 'StableDiffusion'):
+    if not file_item.encode_control_in_text_embeddings:
+        return None
+    if file_item.control_path is None:
+        if getattr(sd, "encodes_text_without_control", False):
+            # a plain text-to-image item for a model that handles one: the caption alone
+            return None
+        raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
+
+    ctrl_img_list = []
+    control_path_list = file_item.control_path
+    if not isinstance(control_path_list, list):
+        control_path_list = [control_path_list]
+    for control_path in control_path_list:
+        try:
+            img = Image.open(control_path).convert("RGB")
+            img = exif_transpose(img)
+            img = TF.to_tensor(img).unsqueeze(0).to(sd.device_torch, dtype=sd.torch_dtype)
+            ctrl_img_list.append(img)
+        except Exception as e:
+            print_acc(f"Error: {e}")
+            print_acc(f"Error loading control image: {control_path}")
+
+    if len(ctrl_img_list) == 0:
+        return None
+    if not sd.has_multiple_control_images:
+        return ctrl_img_list[0]
+    return ctrl_img_list
+
+
+def encode_prompt_embeds_for_file_items(
+        sd: 'StableDiffusion',
+        file_items: List['FileItemDTO'],
+) -> PromptEmbeds:
+    if len(file_items) == 0:
+        raise ValueError("file_items cannot be empty")
+
+    for file_item in file_items:
+        if file_item.caption is None:
+            file_item.load_caption()
+
+    uses_control = any([file_item.encode_control_in_text_embeddings for file_item in file_items])
+    if not uses_control:
+        prompts = [file_item.caption for file_item in file_items]
+        return sd.encode_prompt(prompts)
+
+    prompt_embeds_list = []
+    for file_item in file_items:
+        control_images = load_control_images_for_text_embedding(file_item, sd)
+        prompt_embeds_list.append(
+            sd.encode_prompt(file_item.caption, control_images=control_images)
+        )
+
+    return concat_prompt_embeds(prompt_embeds_list, padding_side=file_items[0].te_padding_side)
+
+
+def hydrate_file_items_from_cached_text_embeddings(
+        file_items: List['FileItemDTO'],
+):
+    shard_groups: Dict[str, List[tuple]] = {}
+
+    for file_item in file_items:
+        if not file_item.is_text_embedding_cached or file_item.prompt_embeds is not None:
+            continue
+
+        storage_entry = file_item.get_text_embedding_storage_entry()
+        if storage_entry is None:
+            continue
+
+        if storage_entry["storage"] == "legacy":
+            # The legacy WRITER (shard_size == 1, below) is polymorphic --
+            # prompt_embeds.save(path) -- but this READER was hardcoded to
+            # PromptEmbeds, so an AdvancedPromptEmbeds entry (krea2 / minimax_h3)
+            # blew up with "No text embeds found in state dict". Reached three ways:
+            # text_embedding_cache_shard_size == 1, ANY leftover legacy .safetensors
+            # (probed unconditionally by get_text_embedding_storage_entry regardless
+            # of shard_size), or the caches_only glob fallback.
+            # AdvancedPromptEmbeds.save() stamps class_name in the metadata; dispatch on it.
+            _legacy_path = storage_entry["path"]
+            _legacy_cls = PromptEmbeds
+            try:
+                with safe_open(_legacy_path, framework="pt") as _lf:
+                    _lmeta = _lf.metadata() or {}
+                if _lmeta.get("class_name") == "AdvancedPromptEmbeds":
+                    _legacy_cls = AdvancedPromptEmbeds
+            except Exception:
+                pass
+            file_item.prompt_embeds = _legacy_cls.load(_legacy_path)
+            continue
+
+        shard_groups.setdefault(storage_entry["path"], []).append(
+            (file_item, storage_entry["key_prefix"])
+        )
+
+    for shard_path, shard_items in shard_groups.items():
+        with safe_open(shard_path, framework="pt", device="cpu") as shard_file:
+            available_keys = sorted(list(shard_file.keys()))
+            for file_item, key_prefix in shard_items:
+                state_dict = OrderedDict()
+                tensor_prefix = f"{key_prefix}{TEXT_EMBED_CACHE_SHARD_KEY_SEP}"
+                for key in available_keys:
+                    if key.startswith(tensor_prefix):
+                        state_dict[key[len(tensor_prefix):]] = shard_file.get_tensor(key)
+                # Shards can hold entries from either class (krea2 / minimax_h3 use
+                # AdvancedPromptEmbeds), and rebuilding the wrong one yields an object
+                # the model cannot consume. The writer stamps a marker key; dispatch on it.
+                if AdvancedPromptEmbeds.is_advanced_state_dict(state_dict):
+                    file_item.prompt_embeds = AdvancedPromptEmbeds.from_state_dict(state_dict)
+                else:
+                    file_item.prompt_embeds = PromptEmbeds.from_state_dict(state_dict)
+
+
+def cache_file_item_text_embeddings_to_disk(
+        file_item_prompt_embeds_pairs: List[tuple],
+        shard_size: int,
+):
+    if len(file_item_prompt_embeds_pairs) == 0:
+        return
+
+    pending_pairs = []
+    for file_item, prompt_embeds in file_item_prompt_embeds_pairs:
+        storage_entry = file_item.get_text_embedding_storage_entry(recalculate=True)
+        if storage_entry is not None:
+            file_item.is_text_embedding_cached = True
+            continue
+        pending_pairs.append((file_item, prompt_embeds))
+
+    if len(pending_pairs) == 0:
+        return
+
+    shard_size = max(1, shard_size)
+    if shard_size == 1:
+        for file_item, prompt_embeds in pending_pairs:
+            text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
+            os.makedirs(os.path.dirname(text_embedding_path), exist_ok=True)
+            prompt_embeds.save(text_embedding_path)
+            file_item.set_text_embedding_storage_entry({
+                "storage": "legacy",
+                "path": text_embedding_path,
+            })
+            file_item.is_text_embedding_cached = True
+        return
+
+    grouped_pairs: Dict[str, List[tuple]] = {}
+    for file_item, prompt_embeds in pending_pairs:
+        grouped_pairs.setdefault(file_item.get_text_embedding_cache_dir(), []).append((file_item, prompt_embeds))
+
+    manifests: Dict[str, dict] = {}
+    for te_dir, group in grouped_pairs.items():
+        manifest = manifests.get(te_dir)
+        if manifest is None:
+            manifest = get_or_create_text_embed_shard_manifest(te_dir, shard_size)
+            manifests[te_dir] = manifest
+
+        for shard_start in range(0, len(group), shard_size):
+            shard_pairs = group[shard_start:shard_start + shard_size]
+            shard_index = manifest.get("next_shard_index", 0)
+            shard_name = f"text_embeddings_{shard_index:05d}.safetensors"
+            shard_path = os.path.join(te_dir, shard_name)
+
+            shard_state_dict = OrderedDict()
+            for file_item, prompt_embeds in shard_pairs:
+                key_prefix = file_item.get_text_embedding_cache_key()
+                tensor_prefix = f"{key_prefix}{TEXT_EMBED_CACHE_SHARD_KEY_SEP}"
+                for key, value in prompt_embeds.to_state_dict(prefix=tensor_prefix).items():
+                    shard_state_dict[key] = value
+
+            shard_meta = get_meta_for_safetensors(
+                OrderedDict([
+                    ("text_embedding_cache_shard_version", TEXT_EMBED_CACHE_SHARD_VERSION),
+                    ("items", len(shard_pairs)),
+                ])
+            )
+            os.makedirs(te_dir, exist_ok=True)
+            _atomic_save_file(shard_state_dict, shard_path, metadata=shard_meta)
+
+            for file_item, _ in shard_pairs:
+                key_prefix = file_item.get_text_embedding_cache_key()
+                manifest["items"][key_prefix] = {
+                    "shard": shard_name,
+                    "key_prefix": key_prefix,
+                }
+                file_item.set_text_embedding_storage_entry(
+                    build_text_embed_shard_storage_entry(te_dir, shard_name, key_prefix)
+                )
+                file_item.is_text_embedding_cached = True
+
+            manifest["next_shard_index"] = shard_index + 1
+
+    for te_dir, manifest in manifests.items():
+        save_text_embed_shard_manifest(te_dir, manifest)
 
 
 def standardize_images(images):
@@ -182,18 +1324,120 @@ class BucketsMixin:
     def __init__(self):
         self.buckets: Dict[str, Bucket] = {}
         self.batch_indices: List[List[int]] = []
+        self.active_file_indices: List[int] = []
+
+    def _use_balanced_same_folder_clip_sampling(self: 'AiToolkitDataset') -> bool:
+        return bool(
+            getattr(self.dataset_config, 'clip_image_from_same_folder', False)
+            and getattr(self.dataset_config, 'clip_image_from_same_folder_balanced', False)
+        )
+
+    def _get_file_item_parent_folder(self: 'AiToolkitDataset', file_item: 'FileItemDTO') -> str:
+        return os.path.dirname(file_item.path)
+
+    def _build_balanced_folder_order(self: 'AiToolkitDataset', indices: List[int]) -> List[int]:
+        if not self._use_balanced_same_folder_clip_sampling() or len(indices) <= 1:
+            return list(indices)
+
+        folder_queues: Dict[str, List[int]] = defaultdict(list)
+        for idx in indices:
+            folder_key = self._get_file_item_parent_folder(self.file_list[idx])
+            folder_queues[folder_key].append(idx)
+
+        if len(folder_queues) <= 1:
+            return list(indices)
+
+        for queue in folder_queues.values():
+            random.shuffle(queue)
+
+        active_folders = list(folder_queues.keys())
+        random.shuffle(active_folders)
+
+        ordered_indices: List[int] = []
+        while active_folders:
+            random.shuffle(active_folders)
+            next_round: List[str] = []
+            for folder_key in active_folders:
+                queue = folder_queues[folder_key]
+                if len(queue) == 0:
+                    continue
+                ordered_indices.append(queue.pop())
+                if len(queue) > 0:
+                    next_round.append(folder_key)
+            active_folders = next_round
+
+        return ordered_indices
+
+    def prepare_same_folder_clip_image_pairs(self: 'AiToolkitDataset'):
+        if not self._use_balanced_same_folder_clip_sampling():
+            for file_item in self.file_list:
+                file_item.clip_image_epoch_path = None
+            return
+
+        # Only pair among active (bucketed, non-upscale-skipped) images, so a
+        # skipped image can't be selected as the clip reference for a trained one.
+        if getattr(self.dataset_config, "buckets", False):
+            active_indices = list(self.active_file_indices)
+        else:
+            active_indices = list(range(len(self.file_list)))
+
+        # clear everything first; inactive items simply stay unpaired
+        for file_item in self.file_list:
+            file_item.clip_image_epoch_path = None
+
+        folder_groups: Dict[str, List[int]] = defaultdict(list)
+        for idx in active_indices:
+            folder_groups[self._get_file_item_parent_folder(self.file_list[idx])].append(idx)
+
+        for folder_indices in folder_groups.values():
+            if len(folder_indices) == 0:
+                continue
+            if len(folder_indices) == 1:
+                only_idx = folder_indices[0]
+                self.file_list[only_idx].clip_image_epoch_path = self.file_list[only_idx].path
+                continue
+
+            target_indices = list(folder_indices)
+            reference_indices = list(folder_indices)
+            random.shuffle(target_indices)
+            random.shuffle(reference_indices)
+
+            remaining_refs = list(reference_indices)
+            assigned_refs: Dict[int, int] = {}
+
+            for target_idx in target_indices:
+                target_path = self.file_list[target_idx].path
+                valid_refs = [
+                    ref_idx for ref_idx in remaining_refs
+                    if self.file_list[ref_idx].path != target_path
+                ]
+                if len(valid_refs) == 0:
+                    valid_refs = list(remaining_refs)
+
+                chosen_ref_idx = random.choice(valid_refs)
+                remaining_refs.remove(chosen_ref_idx)
+                assigned_refs[target_idx] = chosen_ref_idx
+
+            for target_idx, ref_idx in assigned_refs.items():
+                self.file_list[target_idx].clip_image_epoch_path = self.file_list[ref_idx].path
 
     def build_batch_indices(self: 'AiToolkitDataset'):
         self.batch_indices = []
         for key, bucket in self.buckets.items():
-            for start_idx in range(0, len(bucket.file_list_idx), self.batch_size):
+            ordered_indices = self._build_balanced_folder_order(bucket.file_list_idx)
+            for start_idx in range(0, len(ordered_indices), self.batch_size):
                 end_idx = min(start_idx + self.batch_size, len(bucket.file_list_idx))
-                batch = bucket.file_list_idx[start_idx:end_idx]
+                batch = ordered_indices[start_idx:end_idx]
                 self.batch_indices.append(batch)
 
     def shuffle_buckets(self: 'AiToolkitDataset'):
         for key, bucket in self.buckets.items():
             random.shuffle(bucket.file_list_idx)
+
+    def get_active_bucket_file_items(self: 'AiToolkitDataset') -> List['FileItemDTO']:
+        if not getattr(self.dataset_config, "buckets", False):
+            return list(self.file_list)
+        return [self.file_list[idx] for idx in self.active_file_indices]
 
     def setup_buckets(self: 'AiToolkitDataset', quiet=False):
         if not hasattr(self, 'file_list'):
@@ -206,6 +1450,7 @@ class BucketsMixin:
             # todo handle random cropping for buckets
             return
         self.buckets = {}  # clear it
+        self.active_file_indices = []
 
         config: 'DatasetConfig' = self.dataset_config
         resolution = config.resolution
@@ -280,6 +1525,12 @@ class BucketsMixin:
             if bucket_key not in self.buckets:
                 self.buckets[bucket_key] = Bucket(file_item.crop_width, file_item.crop_height)
             self.buckets[bucket_key].file_list_idx.append(idx)
+            self.active_file_indices.append(idx)
+
+        if len(self.active_file_indices) == 0:
+            raise Exception(
+                f"No images remain in {self.dataset_path} after bucketing"
+            )
 
         # print the buckets
         self.shuffle_buckets()
@@ -322,32 +1573,41 @@ class CaptionProcessingDTOMixin:
             prompt_path = path_no_ext + prompt_ext
             short_caption = None
 
+            prompt_text = None
             if os.path.exists(prompt_path):
                 with open(prompt_path, 'r', encoding='utf-8') as f:
-                    prompt = f.read()
-                    short_caption = None
-                    if prompt_path.endswith('.json'):
-                        # replace any line endings with commas for \n \r \r\n
-                        prompt = prompt.replace('\r\n', ' ')
-                        prompt = prompt.replace('\n', ' ')
-                        prompt = prompt.replace('\r', ' ')
+                    prompt_text = f.read()
+            elif self.dataset_config.caches_only and getattr(self, 'cached_caption_text', None) is not None:
+                # caption sidecar is gone (caches_only): use the caption text
+                # persisted in the size database so the cached text embedding
+                # key still matches
+                prompt_text = self.cached_caption_text
 
-                        prompt_json = json.loads(prompt)
-                        if 'caption' in prompt_json:
-                            prompt = prompt_json['caption']
-                        if 'caption_short' in prompt_json:
-                            short_caption = prompt_json['caption_short']
-                            if self.dataset_config.use_short_captions:
-                                prompt = short_caption
-                        if 'extra_values' in prompt_json:
-                            self.extra_values = prompt_json['extra_values']
+            if prompt_text is not None:
+                prompt = prompt_text
+                short_caption = None
+                if prompt_path.endswith('.json'):
+                    # replace any line endings with commas for \n \r \r\n
+                    prompt = prompt.replace('\r\n', ' ')
+                    prompt = prompt.replace('\n', ' ')
+                    prompt = prompt.replace('\r', ' ')
 
-                    prompt = clean_caption(prompt)
-                    if short_caption is not None:
-                        short_caption = clean_caption(short_caption)
-                    
-                    if prompt.strip() == '' and self.dataset_config.default_caption is not None:
-                        prompt = self.dataset_config.default_caption
+                    prompt_json = json.loads(prompt)
+                    if 'caption' in prompt_json:
+                        prompt = prompt_json['caption']
+                    if 'caption_short' in prompt_json:
+                        short_caption = prompt_json['caption_short']
+                        if self.dataset_config.use_short_captions:
+                            prompt = short_caption
+                    if 'extra_values' in prompt_json:
+                        self.extra_values = prompt_json['extra_values']
+
+                prompt = clean_caption(prompt)
+                if short_caption is not None:
+                    short_caption = clean_caption(short_caption)
+
+                if prompt.strip() == '' and self.dataset_config.default_caption is not None:
+                    prompt = self.dataset_config.default_caption
             else:
                 prompt = ''
                 if self.dataset_config.default_caption is not None:
@@ -723,14 +1983,15 @@ class ImageProcessingDTOMixin:
     def load_and_process_image(
             self: 'FileItemDTO',
             transform: Union[None, transforms.Compose],
-            only_load_latents=False
+            only_load_latents=False,
+            prefer_cached_latent=True,
     ):
-        # handle get_prompt_embedding
-        if self.is_text_embedding_cached:
-            self.load_prompt_embedding()
         # if we are caching latents, just do that
-        if self.is_latent_cached:
-            self.get_latent()
+        if self.is_latent_cached and prefer_cached_latent:
+            # For disk-backed caches, defer latent hydration until collation so a
+            # batch can load shard entries together instead of one file per item.
+            if self._encoded_latent is None and not self.is_caching_to_disk:
+                self.get_latent()
             if self.has_control_image:
                 self.load_control_image()
             if self.has_inpaint_image:
@@ -1044,6 +2305,7 @@ class ClipImageFileItemDTOMixin:
             super().__init__(*args, **kwargs)
         self.has_clip_image = False
         self.clip_image_path: Union[str, None] = None
+        self.clip_image_epoch_path: Union[str, None] = None
         self.clip_image_tensor: Union[torch.Tensor, None] = None
         self.clip_image_embeds: Union[dict, None] = None
         self.clip_image_embeds_unconditional: Union[dict, None] = None
@@ -1137,9 +2399,10 @@ class ClipImageFileItemDTOMixin:
         return augmented_tensor
 
     def get_clip_vision_info_dict(self: 'FileItemDTO'):
+        resolved_clip_image_path = self.get_current_clip_image_path()
         item = OrderedDict([
             ("image_encoder_path", self.clip_image_encoder_path),
-            ("filename", os.path.basename(self.clip_image_path)),
+            ("filename", os.path.basename(resolved_clip_image_path)),
             ("is_quad", self.clip_vision_is_quad)
         ])
         # when adding items, do it after so we dont change old latents
@@ -1148,24 +2411,48 @@ class ClipImageFileItemDTOMixin:
         if self.flip_y:
             item["flip_y"] = True
         return item
+
+    def get_clip_vision_cache_dir_candidates(self: 'FileItemDTO'):
+        cache_source_path = self.get_current_clip_image_path()
+        return get_cache_dir_candidates(
+            cache_source_path,
+            '_clip_vision_cache',
+            override_root=self.dataset_config.cache_dir_override,
+            min_free_gb=self.dataset_config.cache_dir_override_min_free_gb,
+        )
+
+    def get_clip_vision_embeddings_path_candidates(self: 'FileItemDTO', recalculate=False):
+        cache_source_path = self.get_current_clip_image_path()
+        hash_dict = self.get_clip_vision_info_dict()
+        filename_no_ext = os.path.splitext(os.path.basename(cache_source_path))[0]
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        hash_str = hash_str.replace('=', '')
+        candidates = []
+        for latent_dir in self.get_clip_vision_cache_dir_candidates():
+            candidates.append(os.path.join(latent_dir, f'{filename_no_ext}_{hash_str}.safetensors'))
+        return candidates
+
     def get_clip_vision_embeddings_path(self: 'FileItemDTO', recalculate=False):
         if self._clip_vision_embeddings_path is not None and not recalculate:
             return self._clip_vision_embeddings_path
-        else:
-            # we store latents in a folder in same path as image called _latent_cache
-            img_dir = os.path.dirname(self.clip_image_path)
-            latent_dir = os.path.join(img_dir, '_clip_vision_cache')
-            hash_dict = self.get_clip_vision_info_dict()
-            filename_no_ext = os.path.splitext(os.path.basename(self.clip_image_path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._clip_vision_embeddings_path = os.path.join(latent_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+
+        candidate_paths = self.get_clip_vision_embeddings_path_candidates(recalculate=recalculate)
+        existing_path = next((path for path in candidate_paths if os.path.exists(path)), None)
+        self._clip_vision_embeddings_path = existing_path or candidate_paths[0]
 
         return self._clip_vision_embeddings_path
     
+    def get_current_clip_image_path(self: 'FileItemDTO'):
+        if self.clip_image_epoch_path is not None:
+            return self.clip_image_epoch_path
+        if self.clip_image_path is not None:
+            return self.clip_image_path
+        return self.path
+
     def get_new_clip_image_path(self: 'FileItemDTO'):
+        if self.clip_image_epoch_path is not None:
+            return self.clip_image_epoch_path
         if self.dataset_config.clip_image_from_same_folder:
             # randomly grab an image path from the same folder
             pool_folder = os.path.dirname(self.path)
@@ -1716,7 +3003,11 @@ class LatentCachingFileItemDTOMixin:
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
         self._cached_audio_latent: Union[torch.Tensor, None] = None
+        self._cached_first_frame_condition: Union[torch.Tensor, None] = None
         self._latent_path: Union[str, None] = None
+        self._latent_cache_key: Union[str, None] = None
+        self._latent_storage_entry: Union[dict, None] = None
+        self._latent_storage_checked = False
         self.is_latent_cached = False
         self.is_caching_to_disk = False
         self.is_caching_to_memory = False
@@ -1737,6 +3028,20 @@ class LatentCachingFileItemDTOMixin:
             ("latent_version", self.latent_version),
         ])
         # when adding items, do it after so we dont change old latents
+        # Include the source file's size + mtime so that editing an image in place
+        # (same path and bucket dims) invalidates its cached latent instead of
+        # silently reusing a stale one. The first run after this is added re-caches
+        # once because the key changes; unchanged files stay cached thereafter.
+        try:
+            _src_stat = os.stat(self.path)
+            item["src_size"] = _src_stat.st_size
+            item["src_mtime_ns"] = _src_stat.st_mtime_ns
+        except OSError:
+            # source file is gone (caches_only): use the stat persisted in the
+            # size database so the key still matches the existing cache entry
+            _cached_stat = getattr(self, 'cached_src_stat', None)
+            if _cached_stat is not None:
+                item["src_size"], item["src_mtime_ns"] = _cached_stat
         if self.flip_x:
             item["flip_x"] = True
         if self.flip_y:
@@ -1753,22 +3058,150 @@ class LatentCachingFileItemDTOMixin:
                 item["audio_preserve_pitch"] = True
         return item
 
+    def get_latent_cache_dir(self: 'FileItemDTO'):
+        return self.get_latent_cache_dir_candidates()[0]
+
+    def get_latent_cache_dir_candidates(self: 'FileItemDTO'):
+        return get_cache_dir_candidates(
+            self.path,
+            '_latent_cache',
+            override_root=self.dataset_config.cache_dir_override,
+            min_free_gb=self.dataset_config.cache_dir_override_min_free_gb,
+        )
+
+    def get_latent_cache_key(self: 'FileItemDTO', recalculate=False):
+        if self._latent_cache_key is not None and not recalculate:
+            return self._latent_cache_key
+
+        hash_dict = self.get_latent_info_dict()
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        self._latent_cache_key = hash_str.replace('=', '')
+        self._latent_path = None
+        self._latent_storage_entry = None
+        self._latent_storage_checked = False
+        return self._latent_cache_key
+
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
         if self._latent_path is not None and not recalculate:
             return self._latent_path
-        else:
-            # we store latents in a folder in same path as image called _latent_cache
-            img_dir = os.path.dirname(self.path)
-            latent_dir = os.path.join(img_dir, '_latent_cache')
-            hash_dict = self.get_latent_info_dict()
-            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._latent_path = os.path.join(latent_dir, f'{filename_no_ext}_{hash_str}.safetensors')
 
+        latent_dir = self.get_latent_cache_dir()
+        filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+        cache_key = self.get_latent_cache_key(recalculate=recalculate)
+        self._latent_path = os.path.join(latent_dir, f'{filename_no_ext}_{cache_key}.safetensors')
         return self._latent_path
+
+    def set_latent_storage_entry(self: 'FileItemDTO', storage_entry: Union[dict, None]):
+        self._latent_storage_entry = storage_entry
+        self._latent_storage_checked = True
+
+    def get_latent_storage_entry(self: 'FileItemDTO', recalculate=False):
+        if self._latent_storage_checked and not recalculate:
+            return self._latent_storage_entry
+
+        cache_key = self.get_latent_cache_key(recalculate=recalculate)
+        storage_entry = None
+
+        for latent_dir in self.get_latent_cache_dir_candidates():
+            buffer_key = (latent_dir, get_latent_shard_bucket_key(self))
+            pending_map = lazy_latent_shard_buffers.get(buffer_key)
+            if pending_map is not None and cache_key in pending_map:
+                storage_entry = build_buffered_latent_storage_entry(
+                    latent_dir,
+                    cache_key,
+                )
+                break
+
+            if has_pending_latent_state(latent_dir, cache_key):
+                storage_entry = build_buffered_latent_storage_entry(
+                    latent_dir,
+                    cache_key,
+                )
+                break
+
+            shard_entry = lookup_latent_index_entry(latent_dir, cache_key)
+            if shard_entry is None:
+                manifest = _maybe_migrate_legacy_latent_manifest(latent_dir)
+                if manifest is not None:
+                    shard_entry = manifest.get("items", {}).get(cache_key)
+            if shard_entry is not None:
+                shard_name = shard_entry.get("shard")
+                if shard_name is not None:
+                    candidate = build_latent_shard_storage_entry(
+                        latent_dir,
+                        shard_name,
+                        shard_entry.get("key_prefix", cache_key),
+                    )
+                    if os.path.exists(candidate["path"]):
+                        storage_entry = candidate
+                        break
+
+            latent_path = os.path.join(
+                latent_dir,
+                f'{os.path.splitext(os.path.basename(self.path))[0]}_{cache_key}.safetensors',
+            )
+            if os.path.exists(latent_path):
+                storage_entry = {
+                    "storage": "legacy",
+                    "path": latent_path,
+                }
+                break
+
+        if storage_entry is None and self.dataset_config.caches_only and not os.path.exists(self.path):
+            storage_entry = self._find_caches_only_latent_fallback()
+
+        self.set_latent_storage_entry(storage_entry)
+        return storage_entry
+
+    def _find_caches_only_latent_fallback(self: 'FileItemDTO'):
+        # caches_only fallbacks for a deleted source file whose exact key missed.
+        # 1) caches written before the src stat was part of the key: recompute the
+        #    key without the stat fields and look it up again.
+        hash_dict = self.get_latent_info_dict()
+        if "src_size" in hash_dict or "src_mtime_ns" in hash_dict:
+            alt_dict = OrderedDict(
+                (k, v) for k, v in hash_dict.items()
+                if k not in ("src_size", "src_mtime_ns")
+            )
+            hash_input = json.dumps(alt_dict, sort_keys=True).encode('utf-8')
+            alt_key = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii').replace('=', '')
+            for latent_dir in self.get_latent_cache_dir_candidates():
+                shard_entry = lookup_latent_index_entry(latent_dir, alt_key)
+                if shard_entry is None:
+                    manifest = _maybe_migrate_legacy_latent_manifest(latent_dir)
+                    if manifest is not None:
+                        shard_entry = manifest.get("items", {}).get(alt_key)
+                if shard_entry is not None and shard_entry.get("shard"):
+                    candidate = build_latent_shard_storage_entry(
+                        latent_dir,
+                        shard_entry["shard"],
+                        shard_entry.get("key_prefix", alt_key),
+                    )
+                    if os.path.exists(candidate["path"]):
+                        return candidate
+                legacy_path = os.path.join(
+                    latent_dir,
+                    f'{os.path.splitext(os.path.basename(self.path))[0]}_{alt_key}.safetensors',
+                )
+                if os.path.exists(legacy_path):
+                    return {"storage": "legacy", "path": legacy_path}
+
+        # 2) single unambiguous legacy per-file cache matching this filename. Only
+        #    safe for non-flipped items (flip variants share the filename prefix).
+        if not self.flip_x and not self.flip_y:
+            filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+            for latent_dir in self.get_latent_cache_dir_candidates():
+                try:
+                    matches = glob.glob(
+                        os.path.join(latent_dir, f'{glob.escape(filename_no_ext)}_*.safetensors')
+                    )
+                except OSError:
+                    continue
+                matches = [m for m in matches if not os.path.basename(m).startswith('bucket_')]
+                if len(matches) == 1:
+                    return {"storage": "legacy", "path": matches[0]}
+        return None
 
     def cleanup_latent(self):
         if self._encoded_latent is not None:
@@ -1777,6 +3210,7 @@ class LatentCachingFileItemDTOMixin:
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
                 self._cached_audio_latent = None
+                self._cached_first_frame_condition = None
             else:
                 # move it back to cpu
                 self._encoded_latent = self._encoded_latent.to('cpu')
@@ -1784,22 +3218,14 @@ class LatentCachingFileItemDTOMixin:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
                 if self._cached_audio_latent is not None:
                     self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+                if self._cached_first_frame_condition is not None:
+                    self._cached_first_frame_condition = self._cached_first_frame_condition.to('cpu')
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
             return None
         if self._encoded_latent is None:
-            # load it from disk
-            state_dict = load_file(
-                self.get_latent_path(),
-                # device=device if device is not None else self.latent_load_device
-                device='cpu'
-            )
-            self._encoded_latent = state_dict['latent']
-            if 'first_frame_latent' in state_dict:
-                self._cached_first_frame_latent = state_dict['first_frame_latent']
-            if 'audio_latent' in state_dict:
-                self._cached_audio_latent = state_dict['audio_latent']
+            hydrate_file_items_from_cached_latents([self])
         return self._encoded_latent
 
 
@@ -1816,95 +3242,513 @@ class LatentCachingMixin:
             # cache all latents to disk
             to_disk = self.is_caching_latents_to_disk
             to_memory = self.is_caching_latents_to_memory
+            shard_size = max(1, self.dataset_config.latent_cache_shard_size)
+            use_shards = to_disk and shard_size > 1
 
             if to_disk:
-                print_acc(" - Saving latents to disk")
+                if use_shards:
+                    print_acc(f" - Saving latents to disk in shards of {shard_size}")
+                else:
+                    print_acc(" - Saving latents to disk")
             if to_memory:
                 print_acc(" - Keeping latents in memory")
             # move sd items to cpu except for vae
             self.sd.set_device_state_preset('cache_latents')
 
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc=f'Caching latents{" to disk" if to_disk else ""}'):
-                file_item.is_caching_to_disk = to_disk
-                file_item.is_caching_to_memory = to_memory
-                file_item.latent_load_device = self.sd.device
+            shard_manifests = {}
+            shard_buffers = {}
+            pending_batches: Dict[tuple, List['FileItemDTO']] = {}
+
+            def infer_next_shard_index(manifest: dict) -> int:
+                max_index = -1
+                for entry in manifest.get("items", {}).values():
+                    shard_name = entry.get("shard", "")
+                    shard_root, shard_ext = os.path.splitext(shard_name)
+                    if shard_ext != ".safetensors":
+                        continue
+                    try:
+                        max_index = max(max_index, int(shard_root.rsplit("_", 1)[1]))
+                    except (IndexError, ValueError):
+                        continue
+                return max_index + 1
+
+            def get_or_create_manifest(latent_dir: str) -> dict:
+                manifest = shard_manifests.get(latent_dir)
+                if manifest is not None:
+                    return manifest
+
+                manifest = load_latent_shard_manifest(latent_dir)
+                if manifest is None:
+                    manifest = {
+                        "version": LATENT_CACHE_SHARD_VERSION,
+                        "shard_size": shard_size,
+                        "next_shard_index": 0,
+                        "items": {},
+                    }
+                else:
+                    manifest["version"] = LATENT_CACHE_SHARD_VERSION
+                    manifest["shard_size"] = shard_size
+                    manifest.setdefault("items", {})
+                    manifest.setdefault(
+                        "next_shard_index",
+                        infer_next_shard_index(manifest),
+                    )
+
+                shard_manifests[latent_dir] = manifest
+                return manifest
+
+            def flush_shard_buffer(buffer_key):
+                pending_items = shard_buffers.get(buffer_key, [])
+                if len(pending_items) == 0:
+                    return
+
+                latent_dir, bucket_key = buffer_key
+                manifest = get_or_create_manifest(latent_dir)
+                shard_index = manifest.get("next_shard_index", 0)
+                shard_name = f"bucket_{bucket_key}_{shard_index:05d}.safetensors"
+                shard_path = os.path.join(latent_dir, shard_name)
+
+                shard_state_dict = OrderedDict()
+                for pending_file_item, pending_state_dict in pending_items:
+                    key_prefix = pending_file_item.get_latent_cache_key()
+                    shard_state_dict[
+                        get_latent_shard_tensor_key(key_prefix, "latent")
+                    ] = pending_state_dict["latent"]
+                    for tensor_name in LATENT_AUX_TENSOR_KEYS:
+                        if tensor_name in pending_state_dict:
+                            shard_state_dict[
+                                get_latent_shard_tensor_key(key_prefix, tensor_name)
+                            ] = pending_state_dict[tensor_name]
+
+                shard_meta = get_meta_for_safetensors(
+                    OrderedDict([
+                        ("latent_cache_shard_version", LATENT_CACHE_SHARD_VERSION),
+                        ("bucket", bucket_key),
+                        ("items", len(pending_items)),
+                    ])
+                )
+                os.makedirs(latent_dir, exist_ok=True)
+                _atomic_save_file(shard_state_dict, shard_path, metadata=shard_meta)
+
+                index_entries = []
+                for pending_file_item, _ in pending_items:
+                    key_prefix = pending_file_item.get_latent_cache_key()
+                    manifest["items"][key_prefix] = {
+                        "shard": shard_name,
+                        "key_prefix": key_prefix,
+                    }
+                    index_entries.append((key_prefix, shard_name, key_prefix))
+                    pending_file_item.set_latent_storage_entry(
+                        build_latent_shard_storage_entry(
+                            latent_dir,
+                            shard_name,
+                            key_prefix,
+                        )
+                    )
+                    pending_file_item.is_latent_cached = True
+
+                manifest["next_shard_index"] = shard_index + 1
+                # Persist the REAL item->shard index entries (not just meta) so the
+                # cache is found on the next run instead of re-encoding everything
+                # and orphaning these shards. (Was: save_latent_shard_manifest_meta
+                # with an empty entries list.)
+                update_latent_index_entries(
+                    latent_dir,
+                    index_entries,
+                    version=manifest.get("version", LATENT_CACHE_SHARD_VERSION),
+                    shard_size=manifest.get("shard_size"),
+                    next_shard_index=manifest.get("next_shard_index"),
+                )
+                shard_buffers[buffer_key] = []
+
+            def is_cuda_oom_error(error: Exception) -> bool:
+                if isinstance(error, torch.cuda.OutOfMemoryError):
+                    return True
+                return "out of memory" in str(error).lower()
+
+            def get_target_cache_batch_size() -> int:
+                if self.sd.device_torch.type != "cuda":
+                    return max(1, min(4, self.batch_size))
+                if self.dataset_config.num_frames > 1:
+                    if self.batch_size > 1:
+                        return max(1, min(4, self.batch_size))
+                    return 2
+                if self.batch_size > 1:
+                    return max(2, min(16, self.batch_size * 4))
+                return 8
+
+            def get_target_cache_load_workers() -> int:
+                if self.dataset_config.num_frames > 1:
+                    return 1
+                cpu_count = os.cpu_count() or 1
+                return max(1, min(8, cpu_count, target_cache_batch_size))
+
+            def get_latent_cache_batch_key(file_item: 'FileItemDTO'):
+                if self.dataset_config.num_frames > 1:
+                    return (
+                        "video",
+                        self.dataset_config.num_frames,
+                        file_item.crop_height,
+                        file_item.crop_width,
+                    )
+                return (
+                    "image",
+                    file_item.crop_height,
+                    file_item.crop_width,
+                )
+
+            def load_file_item_for_latent_cache(file_item: 'FileItemDTO'):
+                file_item.load_and_process_image(self.transform, only_load_latents=True)
+                return file_item
+
+            def get_first_frame_tensor(file_item: 'FileItemDTO'):
+                frames = file_item.tensor
+                if len(frames.shape) == 3:
+                    return frames
+                if len(frames.shape) == 4:
+                    return frames[0]
+                raise ValueError(f"Unknown frame shape {frames.shape}")
+
+            def save_latent_state(file_item: 'FileItemDTO', state_dict: OrderedDict):
+                if not to_disk:
+                    return
+
+                if use_shards:
+                    buffer_key = (
+                        file_item.get_latent_cache_dir(),
+                        get_latent_shard_bucket_key(file_item),
+                    )
+                    shard_buffers.setdefault(buffer_key, []).append((file_item, state_dict))
+                    if len(shard_buffers[buffer_key]) >= shard_size:
+                        flush_shard_buffer(buffer_key)
+                    return
 
                 latent_path = file_item.get_latent_path(recalculate=True)
-                # check if it is saved to disk already
-                if os.path.exists(latent_path):
-                    if to_memory:
-                        # load it into memory
-                        state_dict = load_file(latent_path, device='cpu')
-                        file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
-                        if 'first_frame_latent' in state_dict:
-                            file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
-                        if 'audio_latent' in state_dict:
-                            file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
-                else:
-                    # not saved to disk, calculate
-                    # load the image first
-                    file_item.load_and_process_image(self.transform, only_load_latents=True)
-                    dtype = self.sd.torch_dtype
-                    device = self.sd.device_torch
-                    state_dict = OrderedDict()
-                    first_frame_latent = None
-                    audio_latent = None
-                    # add batch dimension
-                    try:
-                        imgs = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                        latent = self.sd.encode_images(imgs).squeeze(0)
-                        if to_disk:
-                            state_dict['latent'] = latent.clone().detach().cpu()
-                    except Exception as e:
-                        print_acc(f"Error processing image: {file_item.path}")
-                        print_acc(f"Error: {str(e)}")
-                        raise e
-                    # do first frame
-                    if self.dataset_config.num_frames > 1 and self.dataset_config.do_i2v:
-                        frames = file_item.tensor.unsqueeze(0).to(device, dtype=dtype)
-                        if len(frames.shape) == 4:
-                            first_frames = frames
-                        elif len(frames.shape) == 5:
-                            first_frames = frames[:, 0]
-                        else:
-                            raise ValueError(f"Unknown frame shape {frames.shape}")
-                        first_frame_latent = self.sd.encode_images(first_frames).squeeze(0)
-                        if to_disk:
-                            state_dict['first_frame_latent'] = first_frame_latent.clone().detach().cpu()
-                    
-                    # audio
-                    if file_item.audio_data is not None:
-                        audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
-                        if to_disk:
-                            state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
-                    
-                    # save_latent
-                    if to_disk:
-                        # metadata
-                        meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
-                        os.makedirs(os.path.dirname(latent_path), exist_ok=True)
-                        save_file(state_dict, latent_path, metadata=meta)
+                meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
+                os.makedirs(os.path.dirname(latent_path), exist_ok=True)
+                _atomic_save_file(state_dict, latent_path, metadata=meta)
+                file_item.set_latent_storage_entry({
+                    "storage": "legacy",
+                    "path": latent_path,
+                })
 
-                    if to_memory:
-                        # keep it in memory
-                        file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
-                        if first_frame_latent is not None:
-                            file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
-                        if audio_latent is not None:
-                            file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+            def finalize_uncached_file_item(
+                    file_item: 'FileItemDTO',
+                    latent: torch.Tensor,
+                    first_frame_latent: Union[torch.Tensor, None] = None,
+                    audio_latent: Union[torch.Tensor, None] = None,
+                    first_frame_condition: Union[torch.Tensor, None] = None,
+            ):
+                state_dict = OrderedDict()
+                if to_disk:
+                    state_dict["latent"] = latent.clone().detach().cpu()
+                    if first_frame_latent is not None:
+                        state_dict["first_frame_latent"] = (
+                            first_frame_latent.clone().detach().cpu()
+                        )
+                    if audio_latent is not None:
+                        state_dict["audio_latent"] = audio_latent.clone().detach().cpu()
+                    if first_frame_condition is not None:
+                        state_dict["first_frame_condition"] = (
+                            first_frame_condition.clone().detach().cpu()
+                        )
+                    save_latent_state(file_item, state_dict)
 
-                    del imgs
-                    del latent
-                    del file_item.tensor
-                    file_item.cleanup()
+                if to_memory:
+                    assign_latent_tensors(
+                        file_item,
+                        latent,
+                        first_frame_latent,
+                        audio_latent,
+                        first_frame_condition,
+                        dtype=self.sd.torch_dtype,
+                    )
 
+                file_item.cleanup()
                 file_item.is_latent_cached = True
-                i += 1
 
-            # restore device state
-            self.sd.restore_device_state()
+            # Same rule as the lazy path (BaseSDTrainProcess._encode_images_for_lazy_cache):
+            # under low_vram or layer offloading the VAE encodes one image at a time.
+            # get_target_cache_batch_size() returns 8 for batch_size 1 regardless of
+            # VRAM, so this pre-pass used to push 8 full-resolution images through the
+            # VAE at once -- at 1024 that is ~1 GB of activations per image, which
+            # OOM'd a 16 GB card on the very first batch while the lazy path (one at
+            # a time, *during training*) had been fine. Images still load and group
+            # in batches, so disk/decode keeps its parallelism; only the encode is split.
+            _latent_model_config = getattr(self.sd, 'model_config', None)
+            chunk_latent_encode = any([
+                getattr(_latent_model_config, 'low_vram', False),
+                getattr(_latent_model_config, 'layer_offloading', False),
+            ])
+
+            def encode_latent_batch(tensors):
+                if not chunk_latent_encode or len(tensors) <= 1:
+                    return self.sd.encode_images(tensors)
+                return torch.cat([self.sd.encode_images([t]) for t in tensors], dim=0)
+
+            def process_uncached_batch(
+                    file_items: List['FileItemDTO'],
+                    max_batch_size: Union[int, None] = None,
+            ) -> int:
+                if len(file_items) == 0:
+                    return 0
+
+                if max_batch_size is None:
+                    max_batch_size = target_cache_batch_size
+
+                if len(file_items) > max_batch_size:
+                    processed = 0
+                    for start in range(0, len(file_items), max_batch_size):
+                        processed += process_uncached_batch(
+                            file_items[start:start + max_batch_size],
+                            max_batch_size=max_batch_size,
+                        )
+                    return processed
+
+                unloaded_items = [x for x in file_items if x.tensor is None]
+                if len(unloaded_items) > 0:
+                    try:
+                        if target_cache_load_workers > 1 and len(unloaded_items) > 1:
+                            with ThreadPoolExecutor(
+                                    max_workers=min(target_cache_load_workers, len(unloaded_items))
+                            ) as executor:
+                                list(executor.map(load_file_item_for_latent_cache, unloaded_items))
+                        else:
+                            for file_item in unloaded_items:
+                                load_file_item_for_latent_cache(file_item)
+                    except Exception as e:
+                        print_acc(
+                            f"Error loading latent cache batch starting with {file_items[0].path}"
+                        )
+                        print_acc(f"Error: {str(e)}")
+                        raise
+
+                latents = None
+                first_frame_latents = None
+                first_frame_conditions = None
+                audio_latents = None
+                audio_index_pairs = []
+                retry_batch_size = None
+                try:
+                    latents = encode_latent_batch([x.tensor for x in file_items])
+
+                    if self.dataset_config.num_frames > 1 and self.dataset_config.do_i2v:
+                        need_first_frame_latents = self.sd.uses_i2v_first_frame_latents()
+                        need_first_frame_conditions = self.sd.uses_i2v_first_frame_conditions()
+                        first_frames = [get_first_frame_tensor(x) for x in file_items]
+                        if need_first_frame_latents:
+                            first_frame_latents = self.sd.encode_images(
+                                first_frames
+                            )
+                        if need_first_frame_conditions:
+                            first_frame_conditions = self.sd.build_i2v_first_frame_conditions(
+                                latents=latents,
+                                first_frames=torch.stack(first_frames),
+                                first_frame_latents=first_frame_latents,
+                                device=self.sd.device_torch,
+                                dtype=self.sd.torch_dtype,
+                            )
+
+                    audio_index_pairs = [
+                        (idx, x.audio_data)
+                        for idx, x in enumerate(file_items)
+                        if x.audio_data is not None
+                    ]
+                    if len(audio_index_pairs) > 0:
+                        audio_latents = self.sd.encode_audio(
+                            [audio_data for _, audio_data in audio_index_pairs]
+                        )
+                except Exception as e:
+                    if not (len(file_items) > 1 and is_cuda_oom_error(e)):
+                        print_acc(f"Error processing latent cache batch starting with {file_items[0].path}")
+                        print_acc(f"Error: {str(e)}")
+                        raise
+                    retry_batch_size = max(1, len(file_items) // 2)
+
+                if retry_batch_size is not None:
+                    # Retry only AFTER leaving the except block. Inside it, the OOM's
+                    # traceback still references every frame of the failed encode --
+                    # including the VAE's activation tensors -- so flush() freed
+                    # nothing and each smaller retry started on top of the previous
+                    # attempt's memory (a run went 12.28 -> 13.35 -> 13.63 -> 14.41 GiB
+                    # allocated while the batch shrank 8 -> 4 -> 2 -> 1, then died).
+                    latents = first_frame_latents = first_frame_conditions = audio_latents = None
+                    flush()
+                    print_acc(
+                        f"Latent cache batch of {len(file_items)} hit OOM. "
+                        f"Retrying with batch size {retry_batch_size}"
+                    )
+                    processed = 0
+                    for start in range(0, len(file_items), retry_batch_size):
+                        processed += process_uncached_batch(
+                            file_items[start:start + retry_batch_size],
+                            max_batch_size=retry_batch_size,
+                        )
+                    return processed
+
+                audio_latent_map = {}
+                if audio_latents is not None:
+                    for (idx, _), audio_latent in zip(audio_index_pairs, audio_latents):
+                        audio_latent_map[idx] = audio_latent
+
+                for idx, file_item in enumerate(file_items):
+                    finalize_uncached_file_item(
+                        file_item,
+                        latents[idx],
+                        first_frame_latents[idx] if first_frame_latents is not None else None,
+                        audio_latent_map.get(idx),
+                        first_frame_conditions[idx] if first_frame_conditions is not None else None,
+                    )
+
+                del latents
+                if first_frame_latents is not None:
+                    del first_frame_latents
+                if first_frame_conditions is not None:
+                    del first_frame_conditions
+                if audio_latents is not None:
+                    del audio_latents
+                return len(file_items)
+
+            target_cache_batch_size = get_target_cache_batch_size()
+            target_cache_load_workers = get_target_cache_load_workers()
+            cache_iteration_file_list = self.get_active_bucket_file_items()
+            uncached_target_count = 0
+            for file_item in cache_iteration_file_list:
+                storage_entry = file_item.get_latent_storage_entry(recalculate=True)
+                should_migrate_legacy_cache = (
+                    use_shards
+                    and storage_entry is not None
+                    and storage_entry["storage"] == "legacy"
+                )
+                if storage_entry is None or should_migrate_legacy_cache:
+                    uncached_target_count += 1
+            if target_cache_batch_size > 1:
+                cache_iteration_file_list.sort(
+                    key=lambda file_item: (
+                        get_latent_cache_batch_key(file_item),
+                        file_item.path,
+                    )
+                )
+            if target_cache_batch_size > 1:
+                print_acc(
+                    f" - Encoding uncached latents in batches of up to {target_cache_batch_size}"
+                )
+                print_acc(" - Grouping latent cache pass by bucket dimensions")
+                if chunk_latent_encode:
+                    print_acc(" - Low-VRAM mode: the VAE encodes one image at a time within each batch")
+            if target_cache_load_workers > 1:
+                print_acc(
+                    f" - Loading uncached images with up to {target_cache_load_workers} worker threads"
+                )
+
+            cache_started_at = time.monotonic()
+            cached_items_completed = 0
+
+            def update_cache_progress(processed_delta: int):
+                nonlocal cached_items_completed
+                if processed_delta <= 0:
+                    return
+                cached_items_completed += processed_delta
+                self.report_cache_progress(
+                    "latents",
+                    cached_items_completed,
+                    uncached_target_count,
+                    time.monotonic() - cache_started_at,
+                )
+
+            progress = tqdm(
+                total=len(cache_iteration_file_list),
+                desc=f'Caching latents{" to disk" if to_disk else ""}',
+            )
+            try:
+                for file_item in cache_iteration_file_list:
+                    file_item.is_caching_to_disk = to_disk
+                    file_item.is_caching_to_memory = to_memory
+                    file_item.latent_load_device = self.sd.device
+
+                    storage_entry = file_item.get_latent_storage_entry()
+                    should_migrate_legacy_cache = (
+                        use_shards
+                        and storage_entry is not None
+                        and storage_entry["storage"] == "legacy"
+                    )
+
+                    if storage_entry is not None and not should_migrate_legacy_cache:
+                        if to_memory:
+                            hydrate_file_items_from_cached_latents(
+                                [file_item],
+                                dtype=self.sd.torch_dtype,
+                            )
+                        file_item.is_latent_cached = True
+                        progress.update(1)
+                        continue
+
+                    if should_migrate_legacy_cache:
+                        state_dict = load_file(storage_entry["path"], device="cpu")
+                        if to_memory:
+                            assign_latent_tensors(
+                                file_item,
+                                state_dict["latent"],
+                                state_dict.get("first_frame_latent"),
+                                state_dict.get("audio_latent"),
+                                state_dict.get("first_frame_condition"),
+                                dtype=self.sd.torch_dtype,
+                            )
+
+                        buffer_key = (
+                            file_item.get_latent_cache_dir(),
+                            get_latent_shard_bucket_key(file_item),
+                        )
+                        shard_buffers.setdefault(buffer_key, []).append((
+                            file_item,
+                            OrderedDict(
+                                [
+                                    ("latent", state_dict["latent"]),
+                                ]
+                            ),
+                        ))
+                        for tensor_name in LATENT_AUX_TENSOR_KEYS:
+                            if tensor_name in state_dict:
+                                shard_buffers[buffer_key][-1][1][tensor_name] = (
+                                    state_dict[tensor_name]
+                                )
+
+                        if len(shard_buffers[buffer_key]) >= shard_size:
+                            flush_shard_buffer(buffer_key)
+
+                        file_item.is_latent_cached = True
+                        progress.update(1)
+                        update_cache_progress(1)
+                        continue
+
+                    batch_key = get_latent_cache_batch_key(file_item)
+                    pending_batches.setdefault(batch_key, []).append(file_item)
+                    if len(pending_batches[batch_key]) >= target_cache_batch_size:
+                        processed_count = process_uncached_batch(
+                            pending_batches.pop(batch_key)
+                        )
+                        progress.update(processed_count)
+                        update_cache_progress(processed_count)
+
+                for batch_key in list(pending_batches.keys()):
+                    processed_count = process_uncached_batch(
+                        pending_batches.pop(batch_key)
+                    )
+                    progress.update(processed_count)
+                    update_cache_progress(processed_count)
+
+                for buffer_key in list(shard_buffers.keys()):
+                    flush_shard_buffer(buffer_key)
+            finally:
+                if uncached_target_count > 0:
+                    self.report_cache_progress(
+                        "latents",
+                        cached_items_completed,
+                        uncached_target_count,
+                        time.monotonic() - cache_started_at,
+                    )
+                progress.close()
+                self.sd.restore_device_state()
 
 
 class TextEmbeddingFileItemDTOMixin:
@@ -1914,9 +3758,16 @@ class TextEmbeddingFileItemDTOMixin:
             super().__init__(*args, **kwargs)
         self.prompt_embeds: Union[PromptEmbeds, None] = None
         self._text_embedding_path: Union[str, None] = None
+        self._text_embedding_cache_key: Union[str, None] = None
+        self._text_embedding_storage_entry: Union[dict, None] = None
+        self._text_embedding_storage_checked = False
         self.is_text_embedding_cached = False
         self.text_embedding_load_device = 'cpu'
-        self.text_embedding_version = 1
+        # Z-Image stores prompt embeddings as a list of per-prompt 2D tensors.
+        # Older cache entries split those tensors incorrectly, so keep them out
+        # of future lookups without invalidating other model families.
+        text_embedding_space_version = getattr(self, "text_embedding_space_version", "")
+        self.text_embedding_version = 2 if text_embedding_space_version.startswith("zimage") else 1
 
     def get_text_embedding_info_dict(self: 'FileItemDTO'):
         # make sure the caption is loaded here
@@ -1933,22 +3784,99 @@ class TextEmbeddingFileItemDTOMixin:
             item["control_path"] = self.control_path
         return item
 
+    def get_text_embedding_cache_dir(self: 'FileItemDTO'):
+        return self.get_text_embedding_cache_dir_candidates()[0]
+
+    def get_text_embedding_cache_dir_candidates(self: 'FileItemDTO'):
+        return get_cache_dir_candidates(
+            self.path,
+            '_t_e_cache',
+            override_root=self.dataset_config.cache_dir_override,
+            min_free_gb=self.dataset_config.cache_dir_override_min_free_gb,
+        )
+
+    def get_text_embedding_cache_key(self: 'FileItemDTO', recalculate=False):
+        if self._text_embedding_cache_key is not None and not recalculate:
+            return self._text_embedding_cache_key
+
+        hash_dict = self.get_text_embedding_info_dict()
+        hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
+        hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
+        self._text_embedding_cache_key = hash_str.replace('=', '')
+        self._text_embedding_path = None
+        self._text_embedding_storage_entry = None
+        self._text_embedding_storage_checked = False
+        return self._text_embedding_cache_key
+
     def get_text_embedding_path(self: 'FileItemDTO', recalculate=False):
         if self._text_embedding_path is not None and not recalculate:
             return self._text_embedding_path
         else:
-            # we store text embeddings in a folder in same path as image called _text_embedding_cache
-            img_dir = os.path.dirname(self.path)
-            te_dir = os.path.join(img_dir, '_t_e_cache')
-            hash_dict = self.get_text_embedding_info_dict()
+            te_dir = self.get_text_embedding_cache_dir()
             filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
-            # get base64 hash of md5 checksum of hash_dict
-            hash_input = json.dumps(hash_dict, sort_keys=True).encode('utf-8')
-            hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
-            hash_str = hash_str.replace('=', '')
-            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{hash_str}.safetensors')
+            cache_key = self.get_text_embedding_cache_key(recalculate=recalculate)
+            self._text_embedding_path = os.path.join(te_dir, f'{filename_no_ext}_{cache_key}.safetensors')
 
         return self._text_embedding_path
+
+    def set_text_embedding_storage_entry(self: 'FileItemDTO', storage_entry: Union[dict, None]):
+        self._text_embedding_storage_entry = storage_entry
+        self._text_embedding_storage_checked = True
+
+    def get_text_embedding_storage_entry(self: 'FileItemDTO', recalculate=False):
+        if self._text_embedding_storage_checked and not recalculate:
+            return self._text_embedding_storage_entry
+
+        cache_key = self.get_text_embedding_cache_key(recalculate=recalculate)
+        storage_entry = None
+
+        for te_dir in self.get_text_embedding_cache_dir_candidates():
+            manifest = load_text_embed_shard_manifest(te_dir)
+            if manifest is not None:
+                shard_entry = manifest.get("items", {}).get(cache_key)
+                if shard_entry is not None:
+                    shard_name = shard_entry.get("shard")
+                    if shard_name is not None:
+                        candidate = build_text_embed_shard_storage_entry(
+                            te_dir,
+                            shard_name,
+                            shard_entry.get("key_prefix", cache_key),
+                        )
+                        if os.path.exists(candidate["path"]):
+                            storage_entry = candidate
+                            break
+
+            text_embedding_path = os.path.join(
+                te_dir,
+                f'{os.path.splitext(os.path.basename(self.path))[0]}_{cache_key}.safetensors',
+            )
+            if os.path.exists(text_embedding_path):
+                storage_entry = {
+                    "storage": "legacy",
+                    "path": text_embedding_path,
+                }
+                break
+
+        if storage_entry is None and self.dataset_config.caches_only:
+            # caches_only: if the caption sidecar is gone and its text was never
+            # persisted, the recomputed key can't match. Fall back to a single
+            # unambiguous legacy per-file cache for this filename.
+            caption_path = os.path.splitext(self.path)[0] + self.dataset_config.caption_ext
+            if not os.path.exists(caption_path) and getattr(self, 'cached_caption_text', None) is None:
+                filename_no_ext = os.path.splitext(os.path.basename(self.path))[0]
+                for te_dir in self.get_text_embedding_cache_dir_candidates():
+                    try:
+                        matches = glob.glob(
+                            os.path.join(te_dir, f'{glob.escape(filename_no_ext)}_*.safetensors')
+                        )
+                    except OSError:
+                        continue
+                    if len(matches) == 1:
+                        storage_entry = {"storage": "legacy", "path": matches[0]}
+                        break
+
+        self.set_text_embedding_storage_entry(storage_entry)
+        return storage_entry
 
     def cleanup_text_embedding(self):
         if self.prompt_embeds is not None:
@@ -1959,8 +3887,7 @@ class TextEmbeddingFileItemDTOMixin:
         if not self.is_text_embedding_cached:
             return
         if self.prompt_embeds is None:
-            # load it from disk
-            self.prompt_embeds = PromptEmbeds.load(self.get_text_embedding_path())
+            hydrate_file_items_from_cached_text_embeddings([self])
 
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
@@ -1976,55 +3903,61 @@ class TextEmbeddingCachingMixin:
             
             did_move = False
 
-            # use tqdm to show progress
-            i = 0
-            for file_item in tqdm(self.file_list, desc='Caching text embeddings to disk'):
-                file_item.latent_load_device = self.sd.device
+            encode_batch_size = max(1, min(32, self.dataset_config.text_embedding_cache_shard_size))
+            cache_started_at = time.monotonic()
+            processed_items = 0
+            active_file_items = self.get_active_bucket_file_items()
+            total_items = len(active_file_items)
+            pending_file_items = []
+            progress = tqdm(total=total_items, desc='Caching text embeddings to disk')
 
-                text_embedding_path = file_item.get_text_embedding_path(recalculate=True)
-                # only process if not saved to disk
-                if not os.path.exists(text_embedding_path):
-                    # load if not loaded
-                    if not did_move:
-                        self.sd.set_device_state_preset('cache_text_encoder')
-                        did_move = True
-                        
-                    if file_item.encode_control_in_text_embeddings:
-                        if file_item.control_path is None:
-                            raise Exception(f"Could not find a control image for {file_item.path} which is needed for this model")
-                        ctrl_img_list = []
-                        control_path_list = file_item.control_path
-                        if not isinstance(file_item.control_path, list):
-                            control_path_list = [control_path_list]
-                        for i in range(len(control_path_list)):
-                            try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
-                                img = exif_transpose(img)
-                                # convert to 0 to 1 tensor
-                                img = (
-                                    TF.to_tensor(img)
-                                    .unsqueeze(0)
-                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
-                                )
-                                ctrl_img_list.append(img)
-                            except Exception as e:
-                                print_acc(f"Error: {e}")
-                                print_acc(f"Error loading control image: {control_path_list[i]}")
-                        
-                        if len(ctrl_img_list) == 0:
-                            ctrl_img = None
-                        elif not self.sd.has_multiple_control_images:
-                            ctrl_img = ctrl_img_list[0]
-                        else:
-                            ctrl_img = ctrl_img_list
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption, control_images=ctrl_img)
+            def encode_and_cache_pending():
+                nonlocal did_move
+                if len(pending_file_items) == 0:
+                    return
+
+                if not did_move:
+                    self.sd.set_device_state_preset('cache_text_encoder')
+                    did_move = True
+
+                batch_prompt_embeds = encode_prompt_embeds_for_file_items(self.sd, pending_file_items)
+                split_embeds = split_prompt_embeds(batch_prompt_embeds, len(pending_file_items))
+                cache_file_item_text_embeddings_to_disk(
+                    list(zip(pending_file_items, split_embeds)),
+                    self.dataset_config.text_embedding_cache_shard_size,
+                )
+                pending_file_items.clear()
+                del batch_prompt_embeds
+
+            try:
+                for file_item in active_file_items:
+                    file_item.load_caption(self.caption_dict)
+                    storage_entry = file_item.get_text_embedding_storage_entry(recalculate=True)
+                    if storage_entry is not None:
+                        file_item.is_text_embedding_cached = True
                     else:
-                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(file_item.caption)
-                    # save it
-                    prompt_embeds.save(text_embedding_path)
-                    del prompt_embeds
-                file_item.is_text_embedding_cached = True
-                i += 1
+                        pending_file_items.append(file_item)
+                        if len(pending_file_items) >= encode_batch_size:
+                            encode_and_cache_pending()
+
+                    processed_items += 1
+                    progress.update(1)
+                    self.report_cache_progress(
+                        "text_embeddings",
+                        processed_items,
+                        total_items,
+                        time.monotonic() - cache_started_at,
+                    )
+                encode_and_cache_pending()
+            finally:
+                if total_items > 0:
+                    self.report_cache_progress(
+                        "text_embeddings",
+                        processed_items,
+                        total_items,
+                        time.monotonic() - cache_started_at,
+                    )
+                progress.close()
             # restore device state
             # if did_move:
             #     self.sd.restore_device_state()
@@ -2086,9 +4019,15 @@ class CLIPCachingMixin:
 
             # cache unconditionals
             print_acc(f" - Caching {self.clip_vision_num_unconditional_cache} unconditional clip vision to disk")
-            clip_vision_cache_path = os.path.join(self.dataset_config.clip_image_path, '_clip_vision_cache')
-
             unconditional_paths = []
+            pending_file_items = []
+            for file_item in self.get_active_bucket_file_items():
+                embedding_path = file_item.get_clip_vision_embeddings_path(recalculate=True)
+                if not os.path.exists(embedding_path):
+                    pending_file_items.append(file_item)
+            cache_started_at = time.monotonic()
+            total_pending_items = len(pending_file_items)
+            processed_items = 0
 
             is_noise_zero = hasattr(self.sd.adapter, 'clip_noise_zero') and self.sd.adapter.clip_noise_zero
 
@@ -2103,8 +4042,18 @@ class CLIPCachingMixin:
                 hash_str = base64.urlsafe_b64encode(hashlib.md5(hash_input).digest()).decode('ascii')
                 hash_str = hash_str.replace('=', '')
 
-                uncond_path = os.path.join(clip_vision_cache_path, f'uncond_{hash_str}_{i}.safetensors')
-                if os.path.exists(uncond_path):
+                uncond_path_candidates = get_cache_file_candidates(
+                    self.dataset_config.clip_image_path,
+                    f'uncond_{hash_str}_{i}.safetensors',
+                    override_root=self.dataset_config.cache_dir_override,
+                    min_free_gb=self.dataset_config.cache_dir_override_min_free_gb,
+                )
+                existing_uncond_path = next(
+                    (path for path in uncond_path_candidates if os.path.exists(path)),
+                    None,
+                )
+                uncond_path = existing_uncond_path or uncond_path_candidates[0]
+                if existing_uncond_path is not None:
                     # skip it
                     unconditional_paths.append(uncond_path)
                     continue
@@ -2141,7 +4090,7 @@ class CLIPCachingMixin:
                 ])
 
                 os.makedirs(os.path.dirname(uncond_path), exist_ok=True)
-                save_file(state_dict, uncond_path)
+                _atomic_save_file(state_dict, uncond_path)
                 unconditional_paths.append(uncond_path)
 
             self.clip_vision_unconditional_cache = unconditional_paths
@@ -2186,18 +4135,33 @@ class CLIPCachingMixin:
                     # metadata
                     meta = get_meta_for_safetensors(file_item.get_clip_vision_info_dict())
                     os.makedirs(os.path.dirname(embedding_path), exist_ok=True)
-                    save_file(state_dict, embedding_path, metadata=meta)
+                    _atomic_save_file(state_dict, embedding_path, metadata=meta)
 
                     del clip_image
                     del clip_output
                     del file_item.clip_image_tensor
 
                     # flush(garbage_collect=False)
+                    processed_items += 1
+                    self.report_cache_progress(
+                        "clip_vision",
+                        processed_items,
+                        total_pending_items,
+                        time.monotonic() - cache_started_at,
+                    )
                 file_item.is_vision_clip_cached = True
                 i += 1
             # flush every 100
             # if i % 100 == 0:
             #     flush()
+
+            if total_pending_items > 0:
+                self.report_cache_progress(
+                    "clip_vision",
+                    processed_items,
+                    total_pending_items,
+                    time.monotonic() - cache_started_at,
+                )
 
         # restore device state
         self.sd.restore_device_state()

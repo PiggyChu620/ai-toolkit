@@ -1,10 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
+import prisma from '@/server/prisma';
 
-const prisma = new PrismaClient();
-
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
-  const { jobID } = await params;
+export async function GET(request: NextRequest, context: { params: Promise<{ jobID: string }> }) {
+  const { jobID } = await context.params;
 
   const job = await prisma.job.findUnique({
     where: { id: jobID },
@@ -39,8 +37,13 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
     await prisma.queue.create({
       data: {
         gpu_ids: job.gpu_ids,
-        is_running: false,
+        is_running: true,
       },
+    });
+  } else if (!queue.is_running) {
+    await prisma.queue.update({
+      where: { id: queue.id },
+      data: { is_running: true },
     });
   }
 
@@ -51,6 +54,8 @@ export async function GET(request: NextRequest, { params }: { params: { jobID: s
       stop: false,
       return_to_queue: false,
       info: 'Job queued',
+      speed_string: '',
+      cache_speed_string: '',
     },
   });
 

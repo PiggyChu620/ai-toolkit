@@ -287,6 +287,7 @@ export default function AudioPlayer({
 
   // WebAudio analyser
   const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const timeRef = useRef<Uint8Array | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -362,6 +363,42 @@ export default function AudioPlayer({
       if (albumArtBlobUrlRef.current) {
         URL.revokeObjectURL(albumArtBlobUrlRef.current);
         albumArtBlobUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      stopLoop();
+
+      const el = audioRef.current;
+      if (el) {
+        el.pause();
+        el.removeAttribute('src');
+        el.load();
+      }
+
+      try {
+        sourceNodeRef.current?.disconnect();
+      } catch {
+        // ignore cleanup errors from partially constructed graphs
+      }
+      try {
+        analyserRef.current?.disconnect();
+      } catch {
+        // ignore cleanup errors from partially constructed graphs
+      }
+
+      sourceNodeRef.current = null;
+      analyserRef.current = null;
+      timeRef.current = null;
+
+      const ctx = audioCtxRef.current;
+      audioCtxRef.current = null;
+      if (ctx && ctx.state !== 'closed') {
+        void ctx.close().catch(() => {
+          // ignore close races during unmount
+        });
       }
     };
   }, []);
@@ -482,6 +519,7 @@ export default function AudioPlayer({
     analyser.connect(ctx.destination);
 
     audioCtxRef.current = ctx;
+    sourceNodeRef.current = srcNode;
     analyserRef.current = analyser;
     timeRef.current = new Uint8Array(analyser.fftSize);
   }

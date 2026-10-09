@@ -2,12 +2,13 @@ import { useMemo } from 'react';
 import useJobsList from '@/hooks/useJobsList';
 import Link from 'next/link';
 import UniversalTable, { TableColumn } from '@/components/UniversalTable';
-import { GpuInfo, JobConfig } from '@/types';
+import { GpuInfo } from '@/types';
 import JobActionBar from './JobActionBar';
 import { Job, Queue } from '@prisma/client';
 import useQueueList from '@/hooks/useQueueList';
 import classNames from 'classnames';
 import { startQueue, stopQueue } from '@/utils/queue';
+import { getTotalSteps } from '@/utils/jobs';
 import { CgSpinner } from 'react-icons/cg';
 import useGPUInfo from '@/hooks/useGPUInfo';
 
@@ -43,8 +44,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       title: 'Steps',
       key: 'steps',
       render: row => {
-        const jobConfig: JobConfig = JSON.parse(row.job_config);
-        const totalSteps = jobConfig.config.process[0].train.steps;
+        const totalSteps = getTotalSteps(row);
 
         return (
           <div>
@@ -71,7 +71,7 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       render: row => {
         let statusClass = 'text-gray-400';
         if (row.status === 'completed') statusClass = 'text-green-400';
-        if (row.status === 'failed') statusClass = 'text-red-400';
+        if (row.status === 'error') statusClass = 'text-red-400';
         if (row.status === 'running') statusClass = 'text-blue-400';
 
         return <span className={statusClass}>{row.status}</span>;
@@ -81,6 +81,15 @@ export default function JobsTable({ onlyActive = false }: JobsTableProps) {
       title: 'Info',
       key: 'info',
       className: 'truncate max-w-xs',
+      render: row => (
+        <div>
+          <div className="truncate">{row.info}</div>
+          {row.speed_string ? <div className="text-xs text-gray-400 truncate mt-1">Train: {row.speed_string}</div> : null}
+          {row.cache_speed_string ? (
+            <div className="text-xs text-gray-500 truncate mt-1">Cache: {row.cache_speed_string}</div>
+          ) : null}
+        </div>
+      ),
     },
     {
       title: 'Actions',

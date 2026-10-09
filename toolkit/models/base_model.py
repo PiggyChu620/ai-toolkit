@@ -102,6 +102,9 @@ UNET_IN_CHANNELS = 4  # Stable Diffusion の in_channels は 4 で固定。XLも
 class BaseModel:
     # override these in child classes
     arch = None
+    # rename LoRA keys transformer. <-> diffusion_model. (the ComfyUI-standard
+    # prefix) on save/load. Ported from upstream; only Krea2 sets it True.
+    lora_keys_use_comfy_prefix = False
 
     def __init__(
             self,
@@ -350,6 +353,12 @@ class BaseModel:
     def add_after_sample_image_hook(self, func):
         self._after_sample_img_hooks.append(func)
 
+    def remove_after_sample_image_hook(self, func):
+        self._after_sample_img_hooks = [hook for hook in self._after_sample_img_hooks if hook != func]
+
+    def clear_after_sample_image_hooks(self):
+        self._after_sample_img_hooks.clear()
+
     def _status_update(self, status: str):
         for hook in self._status_update_hooks:
             hook(status)
@@ -360,6 +369,20 @@ class BaseModel:
 
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
+
+    def remove_status_update_hook(self, func):
+        self._status_update_hooks = [hook for hook in self._status_update_hooks if hook != func]
+
+    def clear_status_update_hooks(self):
+        self._status_update_hooks.clear()
+
+    def clear_sample_prompts_cache(self):
+        if self.sample_prompts_cache is None:
+            return
+
+        if hasattr(self.sample_prompts_cache, 'clear'):
+            self.sample_prompts_cache.clear()
+        self.sample_prompts_cache = None
 
     @torch.no_grad()
     def generate_images(
@@ -904,12 +927,17 @@ class BaseModel:
                             f"Batch size of latents {latent_model_input.shape[0]} must be the same or half the batch size of timesteps {timestep.shape[0]}")
 
         # predict the noise residual
-        if self.unet.device != self.device_torch:
+        if getattr(self.model_config, "layer_offloading", False):
             try:
                 self.unet.to(self.device_torch)
             except Exception as e:
                 pass
-        if self.unet.dtype != self.torch_dtype:
+        elif self.unet.device != self.device_torch:
+            try:
+                self.unet.to(self.device_torch)
+            except Exception as e:
+                pass
+        if not getattr(self.model_config, "layer_offloading", False) and self.unet.dtype != self.torch_dtype:
             self.unet = self.unet.to(dtype=self.torch_dtype)
             
         # check if get_noise prediction has guidance_embedding_scale
@@ -1130,6 +1158,22 @@ class BaseModel:
     def encode_audio(self, audio_data_list):
         # audio_date_list is a list of {"waveform": waveform[C, L], "sample_rate": int(sample_rate)}
         raise NotImplementedError("Audio encoding not implemented for this model.")
+
+    def uses_i2v_first_frame_latents(self) -> bool:
+        return False
+
+    def uses_i2v_first_frame_conditions(self) -> bool:
+        return False
+
+    def build_i2v_first_frame_conditions(
+            self,
+            latents: torch.Tensor,
+            first_frames: torch.Tensor,
+            first_frame_latents: Optional[torch.Tensor] = None,
+            device=None,
+            dtype=None,
+    ):
+        return None
 
     def decode_latents(
             self,
@@ -1572,13 +1616,69 @@ class BaseModel:
                 encoder.to(*args, **kwargs)
         else:
             self.text_encoder.to(*args, **kwargs)
+
+    def get_text_embedding_space_version(self) -> str:
+        """Text embedding cache key (the data loader stores it with every cached embedding).
+        Override to keep caches apart when model_kwargs change what gets encoded."""
+        return self.model_config.arch
+
+    def component_load_kwargs(self, role: str = "transformer", dtype=None):
+        """kwargs for a v2 module's .load()/.aitk_post_load(), derived from
+        model_config: qtype (with the accuracy recovery adapter recombined),
+        offload fraction, devices, low_vram placement. Roles: "transformer",
+        "te", "vae".
+
+        Ported from upstream base_model.py alongside the v2 subsystem: v2 models
+        (Krea 2) call this to configure their own load/quantize/offload, so it is
+        required for them and inert for every pre-v2 model, which never calls it.
+        """
+        mc = self.model_config
+        qtype, offload = None, 0.0
+        if role == "transformer":
+            if mc.quantize:
+                qtype = mc.qtype
+                if mc.accuracy_recovery_adapter and "|" not in (qtype or ""):
+                    qtype = f"{qtype}|{mc.accuracy_recovery_adapter}"
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_transformer_percent
+        elif role == "te":
+            if mc.quantize_te:
+                qtype = mc.qtype_te
+            if mc.layer_offloading:
+                offload = mc.layer_offloading_text_encoder_percent
+        if dtype is None:
+            dtype = self.vae_torch_dtype if role == "vae" else self.torch_dtype
+        device = self.te_device_torch if role == "te" else self.device_torch
+        if mc.low_vram and role in ("transformer", "te"):
+            device = "cpu"
+        elif role == "vae":
+            device = self.vae_device_torch
+        return dict(
+            qtype=qtype,
+            offload=offload,
+            dtype=dtype,
+            device=device,
+            quantize_device=self.device_torch,
+            base_model=self,
+            use_comfy_weights=mc.model_kwargs.get("use_comfy_weights", True),
+        )
     
     def convert_lora_weights_before_save(self, state_dict):
         # can be overridden in child classes to convert weights before saving
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("transformer.", "diffusion_model."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
     
     def convert_lora_weights_before_load(self, state_dict):
         # can be overridden in child classes to convert weights before loading
+        if self.lora_keys_use_comfy_prefix:
+            return {
+                k.replace("diffusion_model.", "transformer."): v
+                for k, v in state_dict.items()
+            }
         return state_dict
     
     def condition_noisy_latents(self, latents: torch.Tensor, batch:'DataLoaderBatchDTO'):
@@ -1587,6 +1687,13 @@ class BaseModel:
     
     def get_transformer_block_names(self) -> Optional[List[str]]:
         # override in child classes to get transformer block names for lora targeting
+        return None
+
+    def get_quantization_exclude_modules(self) -> Optional[List[str]]:
+        # override in child classes to keep precision-sensitive modules in full
+        # precision when quantizing. Returns fnmatch patterns matched against the
+        # transformer's module names (e.g. "t_embedder*"). None = quantize
+        # everything, which is the pre-existing behavior.
         return None
     
     def get_base_model_version(self) -> str:

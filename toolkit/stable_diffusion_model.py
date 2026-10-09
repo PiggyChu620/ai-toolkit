@@ -26,6 +26,7 @@ from toolkit.clip_vision_adapter import ClipVisionAdapter
 from toolkit.custom_adapter import CustomAdapter
 from toolkit.dequantize import patch_dequantization_on_save
 from toolkit.ip_adapter import IPAdapter
+from toolkit.memory_management import MemoryManager
 from toolkit.util.vae import load_vae
 from toolkit import train_tools
 from toolkit.config_modules import ModelConfig, GenerateImageConfig, ModelArch
@@ -232,6 +233,19 @@ class StableDiffusion:
         # when padding to make batch size work, which side padding to use, right or left
         # some llms need left side padding, others need right side
         self.te_padding_side = "right"
+
+    def _attach_layer_offloading(self, module, offload_percent: float):
+        if not self.model_config.layer_offloading or offload_percent <= 0 or module is None:
+            return
+        if isinstance(module, list):
+            for child_module in module:
+                self._attach_layer_offloading(child_module, offload_percent)
+            return
+        MemoryManager.attach(
+            module,
+            self.device_torch,
+            offload_percent=offload_percent,
+        )
         
     # properties for old arch for backwards compatibility
     @property
@@ -994,6 +1008,10 @@ class StableDiffusion:
 
             pipe.register_to_config(requires_safety_checker=False)
             text_encoder = pipe.text_encoder
+            self._attach_layer_offloading(
+                text_encoder,
+                self.model_config.layer_offloading_text_encoder_percent,
+            )
             text_encoder.to(self.te_device_torch, dtype=self.te_torch_dtype)
             text_encoder.requires_grad_(False)
             text_encoder.eval()
@@ -1010,6 +1028,10 @@ class StableDiffusion:
             self.unet = pipe.transformer
         else:
             self.unet: 'UNet2DConditionModel' = pipe.unet
+        self._attach_layer_offloading(
+            self.unet,
+            self.model_config.layer_offloading_transformer_percent,
+        )
         self.vae: 'AutoencoderKL' = pipe.vae.to(self.vae_device_torch, dtype=self.vae_torch_dtype)
         self.vae.eval()
         self.vae.requires_grad_(False)
@@ -1028,6 +1050,10 @@ class StableDiffusion:
 
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
+        self._attach_layer_offloading(
+            self.text_encoder,
+            self.model_config.layer_offloading_text_encoder_percent,
+        )
         self.pipeline = pipe
         self.load_refiner()
         self.is_loaded = True
@@ -1114,6 +1140,12 @@ class StableDiffusion:
     
     def add_after_sample_image_hook(self, func):
         self._after_sample_img_hooks.append(func)
+
+    def remove_after_sample_image_hook(self, func):
+        self._after_sample_img_hooks = [hook for hook in self._after_sample_img_hooks if hook != func]
+
+    def clear_after_sample_image_hooks(self):
+        self._after_sample_img_hooks.clear()
         
     def _status_update(self, status: str):
         for hook in self._status_update_hooks:
@@ -1125,6 +1157,20 @@ class StableDiffusion:
         
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
+
+    def remove_status_update_hook(self, func):
+        self._status_update_hooks = [hook for hook in self._status_update_hooks if hook != func]
+
+    def clear_status_update_hooks(self):
+        self._status_update_hooks.clear()
+
+    def clear_sample_prompts_cache(self):
+        if self.sample_prompts_cache is None:
+            return
+
+        if hasattr(self.sample_prompts_cache, 'clear'):
+            self.sample_prompts_cache.clear()
+        self.sample_prompts_cache = None
 
     @torch.no_grad()
     def generate_images(
@@ -1897,9 +1943,9 @@ class StableDiffusion:
             do_classifier_free_guidance = False
         elif latents.shape[0] * 2 != text_embeddings.text_embeds.shape[0]:
             raise ValueError("Batch size of latents must be the same or half the batch size of text embeddings")
-        latents = latents.to(self.device_torch)
-        text_embeddings = text_embeddings.to(self.device_torch)
-        timestep = timestep.to(self.device_torch)
+        latents = latents.to(self.device_torch, non_blocking=True)
+        text_embeddings = text_embeddings.to(self.device_torch, non_blocking=True)
+        timestep = timestep.to(self.device_torch, non_blocking=True)
 
         # if timestep is zero dim, unsqueeze it
         if len(timestep.shape) == 0:
@@ -2125,12 +2171,17 @@ class StableDiffusion:
                 else:
                     noise_pred = noise_pred
             else:
-                if self.unet.device != self.device_torch:
+                if getattr(self.model_config, "layer_offloading", False):
                     try:
                         self.unet.to(self.device_torch)
                     except Exception as e:
                         pass
-                if self.unet.dtype != self.torch_dtype:
+                elif self.unet.device != self.device_torch:
+                    try:
+                        self.unet.to(self.device_torch)
+                    except Exception as e:
+                        pass
+                if not getattr(self.model_config, "layer_offloading", False) and self.unet.dtype != self.torch_dtype:
                     self.unet = self.unet.to(dtype=self.torch_dtype)
                 if self.is_flux:
                     with torch.no_grad():
@@ -2530,7 +2581,7 @@ class StableDiffusion:
         self.vae.eval()
         self.vae.requires_grad_(False)
         # move to device and dtype
-        image_list = [image.to(device, dtype=dtype) for image in image_list]
+        image_list = [image.to(device, dtype=dtype, non_blocking=True) for image in image_list]
 
         VAE_SCALE_FACTOR = 2 ** (len(self.vae.config['block_out_channels']) - 1)
 
@@ -2551,7 +2602,7 @@ class StableDiffusion:
         # flux ref https://github.com/black-forest-labs/flux/blob/c23ae247225daba30fbd56058d247cc1b1fc20a3/src/flux/modules/autoencoder.py#L303
         # z = self.scale_factor * (z - self.shift_factor)
         latents = self.vae.config['scaling_factor'] * (latents - shift)
-        latents = latents.to(device, dtype=dtype)
+        latents = latents.to(device, dtype=dtype, non_blocking=True)
 
         return latents
     
@@ -3130,6 +3181,13 @@ class StableDiffusion:
     
     def get_transformer_block_names(self) -> Optional[List[str]]:
         # override in child classes to get transformer block names for lora targeting
+        return None
+
+    def get_quantization_exclude_modules(self) -> Optional[List[str]]:
+        # override in child classes to keep precision-sensitive modules in full
+        # precision when quantizing. Returns fnmatch patterns matched against the
+        # transformer's module names (e.g. "t_embedder*"). None = quantize
+        # everything, which is the pre-existing behavior.
         return None
     
     def get_base_model_version(self) -> str:

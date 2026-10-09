@@ -11,6 +11,8 @@ class Timer:
         self.name = name
         self.max_buffer = max_buffer
         self.timers = OrderedDict()
+        self.lifetime_elapsed = OrderedDict()
+        self.lifetime_counts = OrderedDict()
         self.active_timers = {}
         self.current_timer = None  # Used for the context manager functionality
         self._after_print_hooks = []
@@ -31,6 +33,8 @@ class Timer:
 
         elapsed_time = time.time() - self.active_timers[timer_name]
         self.timers[timer_name].append(elapsed_time)
+        self.lifetime_elapsed[timer_name] = self.lifetime_elapsed.get(timer_name, 0.0) + elapsed_time
+        self.lifetime_counts[timer_name] = self.lifetime_counts.get(timer_name, 0) + 1
 
         # Clean up active timers
         del self.active_timers[timer_name]
@@ -41,6 +45,20 @@ class Timer:
 
     def add_after_print_hook(self, hook):
         self._after_print_hooks.append(hook)
+
+    def remove_after_print_hook(self, hook):
+        self._after_print_hooks = [existing for existing in self._after_print_hooks if existing != hook]
+
+    def clear_after_print_hooks(self):
+        self._after_print_hooks.clear()
+
+    def get_lifetime_average(self, timer_name):
+        if timer_name not in self.lifetime_counts or self.lifetime_counts[timer_name] == 0:
+            return 0.0
+        return self.lifetime_elapsed[timer_name] / self.lifetime_counts[timer_name]
+
+    def get_lifetime_count(self, timer_name):
+        return self.lifetime_counts.get(timer_name, 0)
 
     def print(self):
         if not is_ui:

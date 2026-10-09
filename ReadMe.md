@@ -1,3 +1,40 @@
+# AI Toolkit — PiggyChu620's fork
+
+This repository is a personal fork of [Ostris's AI Toolkit](https://github.com/ostris/ai-toolkit), maintained by [PiggyChu620](https://github.com/PiggyChu620). The original project was created by Ostris, LLC, with contributions from the upstream community. This fork retains the original [MIT license](LICENSE) and copyright notice.
+
+## About this fork
+
+This fork collects local improvements to the training runtime and UI, including:
+
+- Experimental Krea 2, Qwen-Image-2.1, and MiniMax-H3 integrations.
+- Additional quantization utilities and ComfyUI checkpoint import/export.
+- Memory offloading controls, dataset and embedding cache controls, and Windows process management.
+- Training state resume, asynchronous checkpoints, and saving when stopping training.
+- UI restart controls, current-step image previews, and improved job and log handling.
+
+These additions are under active development. Publishing this fork does not imply that every model, GPU, or training configuration has been validated.
+
+## Get this fork
+
+```sh
+git clone --branch customizations https://github.com/PiggyChu620/ai-toolkit.git
+cd ai-toolkit
+```
+
+Use the installation and usage instructions below, substituting this fork's clone command for the upstream clone commands. The `customizations` branch contains this fork's changes; `main` retains the upstream branch created when the fork was made.
+
+## Local files
+
+Personal training configs, datasets, model weights, outputs, training databases and histories, logs, cache files, and secret credentials are excluded from this repository. The files in `config/examples/` are upstream example templates. Copy a suitable example to a local file under `config/` and provide your own dataset paths and credentials locally.
+
+## License and attribution
+
+AI Toolkit is distributed under the [MIT license](LICENSE), copyright © 2024 Ostris, LLC. Credit for the original toolkit belongs to Ostris and the upstream contributors. Model weights and other separately licensed dependencies retain their own terms.
+
+## Original upstream documentation
+
+The original project documentation follows, including upstream support links and tutorials.
+
 # AI Toolkit by Ostris
 
 AI Toolkit is an all in one training suite for diffusion models. I try to support all the latest models on consumer grade hardware. Image and video models. It can be run as a GUI or CLI. It is designed to be easy to use but still have every feature imaginable.

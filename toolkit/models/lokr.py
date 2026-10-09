@@ -103,6 +103,9 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         self.use_w1 = False
         self.use_w2 = False
         self.can_merge_in = True
+        # Only the plain Linear path gets the factorized O(rank) forward.
+        # Conv2d and the cp branch keep using get_weight()/make_kron() below.
+        self._fast_linear = False
 
         self.shape = org_module.weight.shape
         if org_module.__class__.__name__ == 'Conv2d':
@@ -161,6 +164,10 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
             out_l, out_k = factorization(out_dim, factor)
             # ((a, b), (c, d)), out_dim = a*c, in_dim = b*d
             shape = ((out_l, out_k), (in_m, in_n))
+            # stash the factor pair for the factorized (no full-kron) forward
+            self._in_m, self._in_n = in_m, in_n
+            self._out_l, self._out_k = out_l, out_k
+            self._fast_linear = True
 
             # smaller part. weight scale
             if decompose_both and lora_dim < max(shape[0][0], shape[1][0])/2:
@@ -309,7 +316,89 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
                 return self.org_module[0].bias.data.detach()
         return None
 
+    def _get_delta_factors(self):
+        """(A, w2_or_w2a, w2_b_or_None) without ever combining the two kron
+        factors into a full-size matrix."""
+        # A is (out_l, in_m) -- always small
+        A = self.lokr_w1 if self.use_w1 else self.lokr_w1_a @ self.lokr_w1_b
+        if self.use_w2:
+            return A, self.lokr_w2, None
+        else:
+            return A, self.lokr_w2_a, self.lokr_w2_b
+
+    def _call_forward_fast_linear(self, x):
+        """Factorized LoKr delta for the plain Linear case (quantized or not).
+
+        Never materializes a (out_dim, in_dim) tensor: uses the kron
+        mixed-product identity plus the existing low-rank factoring of w2, so
+        both compute and the backward-pass gradient are O(rank) instead of
+        O(out_dim * in_dim).
+
+        The quantized base matmul is left completely untouched -- org_forward()
+        runs it. Under layer_offloading that org_forward is the memory
+        manager's _mm_forward (manager_modules.py), so the base weight is
+        streamed by _BouncingLinearFn instead of being fully copied H2D and
+        dequantized here every step.
+        """
+        if isinstance(x, QTensor) or isinstance(x, QBytesTensor):
+            x = x.dequantize()
+        orig_dtype = x.dtype
+
+        # the legacy path did `x = x.to(orig_weight.dtype)` before the base
+        # matmul; org_forward does not, so keep that coercion here.
+        _bw = getattr(self.org_module[0], 'weight', None)
+        _bd = getattr(_bw, 'dtype', None)
+        if _bd is not None and _bd.is_floating_point and x.dtype != _bd:
+            x = x.to(_bd)
+        base_out = self.org_forward(x)
+
+        A, w2a, w2b = self._get_delta_factors()
+        # match the base path's compute dtype (usually bf16) rather than
+        # upcasting the (much larger) activation tensor to the fp32 master
+        # params -- keeps every intermediate here at the same footprint the
+        # old full-kron GEMM had, instead of doubling it.
+        compute_dtype = base_out.dtype
+        x_ = x.to(compute_dtype) if x.dtype != compute_dtype else x
+        A = A.to(compute_dtype)
+        w2a = w2a.to(compute_dtype)
+        if w2b is not None:
+            w2b = w2b.to(compute_dtype)
+
+        # x[..., q * in_n + s]  ->  X[..., q, s]
+        X = x_.unflatten(-1, (self._in_m, self._in_n))
+
+        if w2b is None:
+            # use_w2: w2a is the full (out_k, in_n) factor -- still far smaller
+            # than the full kron product, so a single einsum here is fine.
+            tmp = torch.einsum('...qs,os->...qo', X, w2a)      # (..., in_m, out_k)
+        else:
+            # low-rank w2 = w2a @ w2b, rank << out_k, in_n: fold the rank
+            # factor through first so we never touch an (out_k, in_n) tensor.
+            tmp = torch.einsum('...qs,rs->...qr', X, w2b)      # (..., in_m, rank)
+            tmp = torch.einsum('...qr,or->...qo', tmp, w2a)    # (..., in_m, out_k)
+
+        # scale folded into A (the small tensor) rather than applied to the
+        # reduction output
+        delta = torch.einsum('...qo,pq->...po', tmp, A * float(self.scale))
+        delta = delta.flatten(-2, -1)                          # -> p * out_k + o
+
+        if self.training and self.rank_dropout:
+            # equivalent to the old row-mask on the full weight: zeroing a
+            # weight ROW is the same as zeroing that output channel post-matmul.
+            drop = torch.rand(delta.size(-1), device=delta.device) < self.rank_dropout
+            delta = delta * drop.to(delta.dtype)
+
+        multiplier = torch.mean(self.network_ref().torch_multiplier).to(compute_dtype)
+        delta = delta * multiplier
+
+        return (base_out + delta).to(orig_dtype)
+
     def _call_forward(self, x):
+        if self._fast_linear:
+            return self._call_forward_fast_linear(x)
+
+        # legacy path: Conv2d / cp branch. Still materializes the full kron
+        # product -- TODO: extend the factorized path to cover these.
         if isinstance(x, QTensor) or isinstance(x, QBytesTensor):
             x = x.dequantize()
 

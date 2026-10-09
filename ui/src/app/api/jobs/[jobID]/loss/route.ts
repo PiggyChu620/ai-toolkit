@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
+import prisma from '@/server/prisma';
 import path from 'path';
 import fs from 'fs';
 import { getTrainingFolder } from '@/server/settings';
@@ -7,8 +7,6 @@ import { getTrainingFolder } from '@/server/settings';
 import sqlite3 from 'sqlite3';
 
 export const runtime = 'nodejs';
-
-const prisma = new PrismaClient();
 
 function openDb(filename: string) {
   const db = new sqlite3.Database(filename);
@@ -31,9 +29,8 @@ function closeDb(db: sqlite3.Database) {
   });
 }
 
-export async function GET(request: NextRequest, { params }: { params: { jobID: string } }) {
-  // this must be awaited to avoid TS error
-  const { jobID } = await params;
+export async function GET(request: NextRequest, context: { params: Promise<{ jobID: string }> }) {
+  const { jobID } = await context.params;
 
   const job = await prisma.job.findUnique({ where: { id: jobID } });
   if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });

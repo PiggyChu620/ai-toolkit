@@ -1,9 +1,7 @@
 import { NextResponse } from 'next/server';
-import { PrismaClient } from '@prisma/client';
 import { defaultTrainFolder, defaultDatasetsFolder } from '@/paths';
+import prisma from '@/server/prisma';
 import { flushCache } from '@/server/settings';
-
-const prisma = new PrismaClient();
 
 export async function GET() {
   try {

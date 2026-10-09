@@ -29,6 +29,12 @@ class SaveConfig:
         self.push_to_hub: bool = kwargs.get("push_to_hub", False)
         self.hf_repo_id: Optional[str] = kwargs.get("hf_repo_id", None)
         self.hf_private: Optional[str] = kwargs.get("hf_private", False)
+        # LoRA checkpoints are written on a background thread while training goes on
+        # (toolkit/checkpoint_writer.py); AI_TOOLKIT_ASYNC_SAVE=0 turns it off too
+        self.async_save: bool = kwargs.get("async_save", True)
+        # stopping from the UI during training: finish the step, save it, then stop
+        # (AI_TOOLKIT_SAVE_ON_STOP=0 turns it off too)
+        self.save_on_stop: bool = kwargs.get("save_on_stop", True)
 
 class LoggingConfig:
     def __init__(self, **kwargs):
@@ -218,6 +224,8 @@ class NetworkConfig:
         
         # start from a pretrained lora
         self.pretrained_lora_path = kwargs.get('pretrained_lora_path', None)
+        # if true, also load the saved step and optimizer state from the imported LoRA run
+        self.resume_training_state = kwargs.get('resume_training_state', False)
 
 
 AdapterTypes = Literal['t2i', 'ip', 'ip+', 'clip', 'ilora', 'photo_maker', 'control_net', 'control_lora', 'i2v']
@@ -354,6 +362,19 @@ class TrainConfig:
         self.content_or_style: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.content_or_style_reg: ContentOrStyleType = kwargs.get('content_or_style', 'balanced')
         self.steps: int = kwargs.get('steps', 1000)
+        # Train-by-epoch: when train_by_epoch is True, `epochs` is resolved to a
+        # concrete `steps` at runtime once the dataloader is built, using the real
+        # batches-per-epoch (see BaseSDTrainProcess._resolve_epoch_based_steps).
+        self.train_by_epoch = kwargs.get('train_by_epoch', False)
+        self.epochs = kwargs.get('epochs', 0)
+        # Global bucket batching: build batches from ONE cross-dataset bucket map so a
+        # single batch can mix items from different datasets that share a compatibility
+        # key (same crop dims, frame count, control/mask/clip arity, cache mode, ...).
+        # Opt-in; when False the dataloader path is byte-identical to before.
+        # NOTE: merging each dataset's partial tail batch lowers batches-per-epoch, so
+        # train_by_epoch resolves to FEWER steps than with this off (same images,
+        # fuller batches). See BaseSDTrainProcess._resolve_epoch_based_steps.
+        self.global_bucket_batching: bool = kwargs.get('global_bucket_batching', False)
         self.lr = kwargs.get('lr', 1e-6)
         self.unet_lr = kwargs.get('unet_lr', self.lr)
         self.text_encoder_lr = kwargs.get('text_encoder_lr', self.lr)
@@ -364,6 +385,12 @@ class TrainConfig:
         self.optimizer_params = kwargs.get('optimizer_params', {})
         self.lr_scheduler = kwargs.get('lr_scheduler', 'constant')
         self.lr_scheduler_params = kwargs.get('lr_scheduler_params', {})
+        # Health-check: hard-error only after this many consecutive real (LR>0)
+        # optimizer steps move zero sampled LoRA weights. Set
+        # disable_optimizer_update_check: true to turn the hard-error off entirely
+        # (useful for adaptive optimizers / very long warmups that can look stuck).
+        self.disable_optimizer_update_check = kwargs.get('disable_optimizer_update_check', False)
+        self.optimizer_update_check_max_consecutive = kwargs.get('optimizer_update_check_max_consecutive', 25)
         self.min_denoising_steps: int = kwargs.get('min_denoising_steps', 0)
         self.max_denoising_steps: int = kwargs.get('max_denoising_steps', 999)
         self.batch_size: int = kwargs.get('batch_size', 1)
@@ -391,6 +418,16 @@ class TrainConfig:
         self.merge_network_on_save = kwargs.get('merge_network_on_save', False)
         self.max_grad_norm = kwargs.get('max_grad_norm', 1.0)
         self.start_step = kwargs.get('start_step', None)
+        # When continuing from an EXTERNAL pretrained LoRA (network.pretrained_lora_path
+        # + network.resume_training_state), train the configured steps/epochs ON TOP of
+        # that LoRA's finished steps (target = pretrained_step + steps) instead of
+        # treating steps as an absolute target. Set False for the old behavior.
+        self.train_on_top_of_loaded_lora = kwargs.get('train_on_top_of_loaded_lora', True)
+        # Skip the startup latent-cache shard compaction. Compaction consolidates
+        # underfilled shards (left by crash-interrupted caching) into full ones, but on
+        # a large, fragmented cache + slow disk it can take many minutes EVERY startup.
+        # Set True to skip it (faster startup; cache stays fragmented until re-enabled).
+        self.disable_latent_cache_compaction = kwargs.get('disable_latent_cache_compaction', False)
         self.free_u = kwargs.get('free_u', False)
         self.adapter_assist_name_or_path: Optional[str] = kwargs.get('adapter_assist_name_or_path', None)
         self.adapter_assist_type: Optional[str] = kwargs.get('adapter_assist_type', 't2i')  # t2i, control_net
@@ -637,6 +674,7 @@ class ModelConfig:
         self.qtype = kwargs.get("qtype", "qfloat8")
         self.qtype_te = kwargs.get("qtype_te", "qfloat8")
         self.low_vram = kwargs.get("low_vram", False)
+        self.auto_low_vram = kwargs.get("auto_low_vram", False)
         self.attn_masking = kwargs.get("attn_masking", False)
         if self.attn_masking and not self.is_flux:
             raise ValueError("attn_masking is only supported with flux models currently")
@@ -661,11 +699,26 @@ class ModelConfig:
         if self.auto_memory:
             print("auto_memory is deprecated, use layer_offloading instead")
         self.layer_offloading = kwargs.get("layer_offloading", self.auto_memory )
+        # Layer offloading streams weights per-layer and needs a tensor-subclass the
+        # offloader can move and dequantize (torchao "float8"), not quanto's "qfloat8".
+        # This rewrite is REQUIRED for offloading to work -- it is not a preference --
+        # but it used to happen silently, so the config said one thing and the run did
+        # another. Announce it instead.
         if self.layer_offloading and self.qtype == "qfloat8":
+            print(
+                "NOTE: layer_offloading is on, so model qtype 'qfloat8' (quanto) is being "
+                "used as 'float8' (torchao). Offloading requires the torchao path; set "
+                "layer_offloading=false if you specifically want quanto qfloat8."
+            )
             self.qtype = "float8"
         if self.layer_offloading and self.qtype_te == "qfloat8":
+            print(
+                "NOTE: layer_offloading is on, so text-encoder qtype_te 'qfloat8' (quanto) "
+                "is being used as 'float8' (torchao)."
+            )
             self.qtype_te = "float8"
-        
+
+        self.auto_layer_offloading_percent = kwargs.get("auto_layer_offloading_percent", False)
         # 0 is off and 1.0 is 100% of the layers
         self.layer_offloading_transformer_percent = kwargs.get("layer_offloading_transformer_percent", 1.0)
         self.layer_offloading_text_encoder_percent = kwargs.get("layer_offloading_text_encoder_percent", 1.0)
@@ -867,6 +920,7 @@ class DatasetConfig:
         # if caption_ext doesnt start with a dot, add it
         if self.caption_ext and not self.caption_ext.startswith('.'):
             self.caption_ext = '.' + self.caption_ext
+        self.must_include_caption: bool = kwargs.get('must_include_caption', False)
         self.random_scale: bool = kwargs.get('random_scale', False)
         self.random_crop: bool = kwargs.get('random_crop', False)
         self.resolution: int = kwargs.get('resolution', 512)
@@ -924,8 +978,35 @@ class DatasetConfig:
         self.cache_latents: bool = kwargs.get('cache_latents', False)
         # cache latents to disk will store them on disk. If both are true, it will save to disk, but keep in memory
         self.cache_latents_to_disk: bool = kwargs.get('cache_latents_to_disk', False)
+        # when enabled with cache_latents_to_disk, latents are written the first
+        # time an item is used instead of precaching the entire dataset up front.
+        self.lazy_cache_latents: bool = kwargs.get('lazy_cache_latents', False)
+        # values above 1 store multiple latent entries per shard file instead of
+        # one file per image. Set to 1 to keep legacy per-image cache files.
+        self.latent_cache_shard_size: int = max(1, int(kwargs.get('latent_cache_shard_size', 64)))
         self.cache_clip_vision_to_disk: bool = kwargs.get('cache_clip_vision_to_disk', False)
         self.cache_text_embeddings: bool = kwargs.get('cache_text_embeddings', False)
+        # when enabled with cache_text_embeddings, text embeddings are written the first
+        # time an item is used instead of precaching the entire dataset up front.
+        self.lazy_cache_text_embeddings: bool = kwargs.get('lazy_cache_text_embeddings', False)
+        # values above 1 store multiple text embedding entries per shard file instead of
+        # one file per image. Set to 1 to keep legacy per-image cache files.
+        self.text_embedding_cache_shard_size: int = max(1, int(kwargs.get('text_embedding_cache_shard_size', 64)))
+        cache_dir_override = kwargs.get('cache_dir_override', None)
+        if cache_dir_override is not None and str(cache_dir_override).strip() == '':
+            cache_dir_override = None
+        self.cache_dir_override: Union[str, None] = cache_dir_override
+        self.cache_dir_override_min_free_gb: float = max(
+            0.0,
+            float(kwargs.get('cache_dir_override_min_free_gb', 10.0))
+        )
+        # train purely from previously built disk caches. Source images and
+        # caption sidecars are not required to exist; items whose cached latent
+        # cannot be found are dropped instead of re-encoded.
+        self.caches_only: bool = kwargs.get('caches_only', False)
+        if self.caches_only and not self.cache_latents_to_disk:
+            print("WARNING: caches_only requires cache_latents_to_disk. Enabling cache_latents_to_disk")
+            self.cache_latents_to_disk = True
 
         self.standardize_images: bool = kwargs.get('standardize_images', False)
 
@@ -940,6 +1021,40 @@ class DatasetConfig:
             print(f"WARNING: Augments are not supported with caching latents. Setting cache_latents to False")
             self.cache_latents = False
             self.cache_latents_to_disk = False
+            self.lazy_cache_latents = False
+
+        if self.lazy_cache_latents and not self.cache_latents_to_disk:
+            print("WARNING: lazy_cache_latents requires cache_latents_to_disk. Disabling lazy_cache_latents")
+            self.lazy_cache_latents = False
+
+        if self.lazy_cache_latents and self.cache_latents:
+            print("WARNING: lazy_cache_latents does not support RAM latent caching. Disabling cache_latents and keeping lazy disk caching enabled")
+            self.cache_latents = False
+
+        if self.lazy_cache_text_embeddings and not self.cache_text_embeddings:
+            print("WARNING: lazy_cache_text_embeddings requires cache_text_embeddings. Disabling lazy_cache_text_embeddings")
+            self.lazy_cache_text_embeddings = False
+
+        # Caption/token dropout is skipped entirely when text embeddings are cached
+        # (get_caption() gates both on `not cache_text_embeddings`), because a cached
+        # embedding is precomputed for the full caption and cannot be re-randomized per
+        # step. That is by design, but it was SILENT: a config asking for dropout got
+        # none, with no indication. Say so loudly rather than quietly training without it.
+        # caption_dropout_rate now WORKS under caching: SDTrainer substitutes the
+        # already-cached blank ("") embedding into dropped batch slots per step
+        # (_apply_cached_caption_dropout). No warning needed for it, and it costs
+        # nothing extra -- the blank embedding is encoded once at setup regardless.
+        # token_dropout_rate still cannot work: it drops a random SUBSET of tokens, so
+        # the caption differs per item per step -- an unbounded set of strings, not one
+        # cacheable value. That one stays disabled, so keep warning about it.
+        if self.cache_text_embeddings and self.token_dropout_rate > 0:
+            print(
+                f"WARNING: cache_text_embeddings is enabled, so token_dropout_rate="
+                f"{self.token_dropout_rate} will have NO EFFECT (each dropped-token caption is "
+                "unique per item per step and cannot be precomputed). caption_dropout_rate is "
+                "unaffected and still works. Set cache_text_embeddings=false for real token "
+                "dropout, or set token_dropout_rate to 0 to silence this."
+            )
 
         # legacy compatability
         legacy_caption_type = kwargs.get('caption_type', None)
@@ -952,13 +1067,31 @@ class DatasetConfig:
         self.clip_image_path: str = kwargs.get('clip_image_path', None)  # depth maps, etc
         # get the clip image randomly from the same folder as the image. Useful for folder grouped pairs.
         self.clip_image_from_same_folder: bool = kwargs.get('clip_image_from_same_folder', False)
+        # when using same-folder clip images, round-robin target sampling by parent folder
+        # and preassign a separate same-folder reference pool each epoch.
+        self.clip_image_from_same_folder_balanced: bool = kwargs.get(
+            'clip_image_from_same_folder_balanced',
+            False,
+        )
         self.clip_image_augmentations: List[dict] = kwargs.get('clip_image_augmentations', None)
         self.clip_image_shuffle_augmentations: bool = kwargs.get('clip_image_shuffle_augmentations', False)
         self.replacements: List[str] = kwargs.get('replacements', [])
         self.loss_multiplier: float = kwargs.get('loss_multiplier', 1.0)
 
+        if self.clip_image_from_same_folder_balanced and not self.clip_image_from_same_folder:
+            print(
+                "WARNING: clip_image_from_same_folder_balanced requires "
+                "clip_image_from_same_folder. Disabling balanced same-folder pairing"
+            )
+            self.clip_image_from_same_folder_balanced = False
+
         self.num_workers: int = kwargs.get('num_workers', 2)
         self.prefetch_factor: int = kwargs.get('prefetch_factor', 2)
+        self.persistent_workers: Union[bool, None] = kwargs.get('persistent_workers', None)
+        self.pin_memory: Union[bool, None] = kwargs.get('pin_memory', None)
+        # Windows dataloader multiprocessing can be unstable in some setups, so the
+        # loader defaults to 0 workers there unless this is explicitly enabled.
+        self.enable_windows_num_workers: bool = kwargs.get('enable_windows_num_workers', False)
         self.extra_values: List[float] = kwargs.get('extra_values', [])
         self.square_crop: bool = kwargs.get('square_crop', False)
         # apply same augmentations to control images. Usually want this true unless special case
