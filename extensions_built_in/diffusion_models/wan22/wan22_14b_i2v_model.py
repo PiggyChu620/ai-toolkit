@@ -176,12 +176,25 @@ class Wan2214bI2VModel(Wan2214bModel):
                 else:
                     raise ValueError(f"Unknown frame shape {frames.shape}")
 
-                # Add conditioning using the standalone function
-                conditioned_latent = add_first_frame_conditioning(
-                    latent_model_input=latent_model_input,
-                    first_frame=first_frames,
-                    vae=self.vae
+                # FORK: with cached latents the trainer parks the VAE on the CPU while the
+                # latents are on the compute device. Bring it over for this encode and put
+                # it back, as build_i2v_first_frame_conditions does at caching time.
+                vae_was_on_cpu = (
+                    self.vae.device == torch.device("cpu")
+                    and latent_model_input.device.type != "cpu"
                 )
+                if vae_was_on_cpu:
+                    self.vae.to(latent_model_input.device)
+                try:
+                    # Add conditioning using the standalone function
+                    conditioned_latent = add_first_frame_conditioning(
+                        latent_model_input=latent_model_input,
+                        first_frame=first_frames,
+                        vae=self.vae
+                    )
+                finally:
+                    if vae_was_on_cpu:
+                        self.vae.to("cpu")
 
         noise_pred = self.model(
             hidden_states=conditioned_latent,

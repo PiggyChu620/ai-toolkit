@@ -450,18 +450,23 @@ class DataLoaderBatchDTO:
                     )
 
             latent_space_version = getattr(self.file_items[0], "latent_space_version", "")
-            needs_i2v_tensor_fallback = (
+            is_i2v_video_dataset = (
                 self.file_items[0].dataset_config.num_frames > 1
                 and self.file_items[0].dataset_config.do_i2v
-                and (
-                    (
-                        latent_space_version == "wan22_14b_i2v"
-                        and self.first_frame_conditions is None
-                    )
-                    or (
-                        latent_space_version in {"wan22_5b", "ltx2", "ltx2.3"}
-                        and self.first_frame_latents is None
-                    )
+            )
+            needs_i2v_tensor_fallback = (
+                # The Wan 2.2 14B image-to-video experts take the first frame as extra
+                # input channels on every batch, so they need it for image datasets and
+                # do_i2v: false datasets too. Those never get a cached condition; without
+                # the source frames in the batch the step raised.
+                (
+                    latent_space_version == "wan22_14b_i2v"
+                    and self.first_frame_conditions is None
+                )
+                or (
+                    is_i2v_video_dataset
+                    and latent_space_version in {"wan22_5b", "ltx2", "ltx2.3"}
+                    and self.first_frame_latents is None
                 )
             )
 
