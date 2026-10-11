@@ -1096,6 +1096,13 @@ class MinimaxH3Model(BaseModel):
     # ComfyUI's MiniMax-H3 keys are the original checkpoint keys, so the
     # standard diffusion_model prefix maps directly
     lora_keys_use_comfy_prefix = True
+    # FORK: the caption alone is complete conditioning for this model (text-to-video
+    # is the no-keyframe case), so dataset items without a control image are cached
+    # as text-only embeds (load_control_images_for_text_embedding) and
+    # blank/trigger/unconditional embeds are plain text, not text plus a stand-in
+    # reference image (SDTrainer.encode_static_prompt). Without it, caching text
+    # embeddings stops at "Could not find a control image ... needed for this model".
+    encodes_text_without_control = True
 
 
 class MinimaxH3Ref2VAModel(MinimaxH3Model):
