@@ -250,7 +250,15 @@ class Wan225bModel(Wan21):
         conditioned_latent = latent_model_input
         noise_mask = None
         
-        if batch.dataset_config.do_i2v:
+        # FORK: enforce the line above. The first-frame conditioning below replaces the
+        # leading latent frame with the clean encoded frame at timestep 0. An image (or
+        # any clip that encodes to a single latent frame) has nothing else, so with
+        # do_i2v on -- the UI default for this model -- it trained on a clean input
+        # against the usual noise target, and with cached latents (no source frames in
+        # the batch) the step raised. Upstream only conditions 5-D (video) frames.
+        do_i2v = batch.dataset_config.do_i2v and latent_model_input.shape[2] > 1
+
+        if do_i2v:
             with torch.no_grad():
                 if batch.first_frame_latents is not None:
                     conditioned_latent, noise_mask = (
