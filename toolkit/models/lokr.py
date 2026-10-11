@@ -107,7 +107,13 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
         # Conv2d and the cp branch keep using get_weight()/make_kron() below.
         self._fast_linear = False
 
-        self.shape = org_module.weight.shape
+        if getattr(org_module, 'is_ostris_quantized', False):
+            # OstrisLinear.weight is a property that dequantizes the whole layer; the
+            # lazy stand-in reports the same shape without materializing it
+            from toolkit.util.ostris_quant import OstrisLazyWeight
+            self.shape = OstrisLazyWeight(org_module).shape
+        else:
+            self.shape = org_module.weight.shape
         if org_module.__class__.__name__ == 'Conv2d':
             in_dim = org_module.in_channels
             k_size = org_module.kernel_size
@@ -346,8 +352,15 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
 
         # the legacy path did `x = x.to(orig_weight.dtype)` before the base
         # matmul; org_forward does not, so keep that coercion here.
-        _bw = getattr(self.org_module[0], 'weight', None)
-        _bd = getattr(_bw, 'dtype', None)
+        _om = self.org_module[0]
+        if getattr(_om, 'is_ostris_quantized', False):
+            # OstrisLinear.weight is a property that dequantizes the whole layer, so
+            # reading it for its dtype did that on every forward of every module.
+            # The dtype that weight would have is stored on the layer.
+            _bd = _om.ostris_orig_dtype
+        else:
+            _bw = getattr(_om, 'weight', None)
+            _bd = getattr(_bw, 'dtype', None)
         if _bd is not None and _bd.is_floating_point and x.dtype != _bd:
             x = x.to(_bd)
         base_out = self.org_forward(x)

@@ -69,7 +69,14 @@ class LoRAModule(ToolkitModuleMixin, ExtractableModuleMixin, torch.nn.Module):
         torch.nn.Module.__init__(self)
         self.lora_name = lora_name
         self.orig_module_ref = weakref.ref(org_module)
-        self.scalar = torch.tensor(1.0, device=org_module.weight.device)
+        if getattr(org_module, 'is_ostris_quantized', False):
+            # OstrisLinear.weight is a property that dequantizes the whole layer, and only
+            # its device is wanted here: the lazy stand-in reports it without doing that
+            from toolkit.util.ostris_quant import OstrisLazyWeight
+            org_weight_device = OstrisLazyWeight(org_module).device
+        else:
+            org_weight_device = org_module.weight.device
+        self.scalar = torch.tensor(1.0, device=org_weight_device)
         
         # if is ara lora module, mark it on the layer so memory manager can handle it
         if is_ara:
