@@ -966,8 +966,10 @@ class DatasetConfig:
         # A folder with fewer other images gives what it has.
         self.control_from_same_folder_count: Tuple[int, int] = (1, 1)
         # at most this many images of each folder are trained as targets; the rest of the folder
-        # still serves as references. Evens out folders of very different sizes. None: all of them.
-        self.control_from_same_folder_max_targets: Union[int, None] = None
+        # still serves as references. Evens out folders of very different sizes. None: all of
+        # them. 'min': as many as the smallest folder has, so that every folder gives the same
+        # number (worked out once the dataset has been scanned).
+        self.control_from_same_folder_max_targets: Union[int, str, None] = None
         # a reference with more pixels than this (width x height) is scaled down to it, keeping
         # its aspect ratio, when it is loaded for a training step. Meant to be the size the model
         # uses references at, so that the reduction is done once, here, with a filter that
@@ -1016,8 +1018,16 @@ class DatasetConfig:
             self.control_from_same_folder_count = (count_min, count_max)
 
             max_targets = setting('control_from_same_folder_max_targets')
-            if max_targets is not None:
-                max_targets = whole_number('control_from_same_folder_max_targets', max_targets)
+            if isinstance(max_targets, str) and max_targets.strip().lower() == 'min':
+                self.control_from_same_folder_max_targets = 'min'
+            elif max_targets is not None:
+                try:
+                    max_targets = whole_number('control_from_same_folder_max_targets', max_targets)
+                except ValueError:
+                    raise ValueError(
+                        f"control_from_same_folder_max_targets must be a whole number or min, "
+                        f"got {max_targets!r}"
+                    ) from None
                 if max_targets < 1:
                     raise ValueError(
                         f"control_from_same_folder_max_targets must be 1 or more, got {max_targets} "

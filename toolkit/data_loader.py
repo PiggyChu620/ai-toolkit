@@ -1154,7 +1154,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         control_from_same_folder_max_targets keeps large folders from outweighing small ones:
         only that many images of a folder, chosen from the seed, are trained as targets. The
-        others are dropped from the dataset but stay available as references.
+        others are dropped from the dataset but stay available as references. 'min' takes
+        the number from the dataset: as many as the smallest folder that has a pair, so
+        that every folder gives the same number of targets.
         """
         dataset_config = self.dataset_config
         if not dataset_config.control_from_same_folder:
@@ -1183,6 +1185,14 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         # the images of each folder that are trained as targets: all, or the first so many
         max_targets = dataset_config.control_from_same_folder_max_targets
+        smallest_text = None
+        if max_targets == 'min':
+            # as many as the smallest folder that has a pair
+            paired = [folder for folder, pool in folder_pools.items() if len(pool) >= 2]
+            max_targets = min((len(folder_pools[folder]) for folder in paired), default=None)
+            smallest = sorted(seed_name(folder) for folder in paired if len(folder_pools[folder]) == max_targets)
+            if len(smallest) > 0:
+                smallest_text = smallest[0] + (f" and {len(smallest) - 1} more" if len(smallest) > 1 else "")
         folder_targets: Dict[str, set] = {}
         if max_targets is not None:
             for folder, pool in folder_pools.items():
@@ -1240,6 +1250,11 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             f"  -  References from the same folder: {len(target_paths)} target image(s) in "
             f"{folders_used} folder(s), {count_text} per target, {when}"
         )
+        if smallest_text is not None:
+            print_acc(
+                f"  -  control_from_same_folder_max_targets: min -> {max_targets} per folder, "
+                f"the size of the smallest folder ({smallest_text})"
+            )
         if len(reference_only_paths) > 0:
             print_acc(
                 f"  -  {len(reference_only_paths)} more image(s) serve as references only "
