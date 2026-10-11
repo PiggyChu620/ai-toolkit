@@ -368,6 +368,9 @@ class DataLoaderBatchDTO:
             # rebuild the clean audio estimate for perceptual losses
             self.audio_noisy: Union[torch.Tensor, None] = None
             self.audio_sigma: Union[torch.Tensor, None] = None
+            # frames per item: the dataset's num_frames (1 for image datasets). Upstream
+            # keeps this per file; in this fork a dataset is all video or all image.
+            self.num_frames: int = self.file_items[0].dataset_config.num_frames
             self.latent_cache_mask: Union[torch.Tensor, None] = None
             self.cached_latent_indices: List[int] = []
             self.missing_latent_indices: List[int] = []

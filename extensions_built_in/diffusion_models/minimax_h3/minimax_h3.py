@@ -227,6 +227,12 @@ class MinimaxH3Model(BaseModel):
         # auto_frame_count: snap dataset clips down to the VAE's 17n+5 grid
         return packing.align_num_frames_down
 
+    def uses_i2v_first_frame_latents(self) -> bool:
+        # FORK: this fork's dataloader caches first-frame latents only for models
+        # that ask for them (upstream caches them for every do_i2v video dataset).
+        # _build_condition reads them as the keyframe of do_i2v video batches.
+        return True
+
     def prepare_sample_prompt_context(self, gen_config):
         # sample prompts: video refs are treated at the sample's length, not
         # the dataset's (which only applies while caching training embeds)
@@ -749,9 +755,17 @@ class MinimaxH3Model(BaseModel):
         else:
             frames = batch.tensor
             if frames is None:
+                # FORK: reached with cached latents when the cache has no first-frame
+                # latents: a do_i2v latent cache written before this model asked for
+                # them (uses_i2v_first_frame_latents). The batch does not reload the
+                # source frames for this model, on purpose: encoding the keyframe
+                # below moves the whole VAE bundle (about 5.8 GB) onto the GPU and
+                # leaves it there, which cached latents exist to avoid.
                 raise ValueError(
                     "do_i2v needs the first frame; no cached "
-                    "first_frame_latents or raw tensors in batch"
+                    "first_frame_latents or raw tensors in batch. This dataset's "
+                    "latent cache was written without first-frame latents: delete "
+                    "its _latent_cache folder so it is rebuilt."
                 )
             first_frames = frames[:, 0] if frames.ndim == 5 else frames
             first_latents = self.encode_keyframe_latents(
