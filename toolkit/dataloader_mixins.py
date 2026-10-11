@@ -1018,6 +1018,25 @@ def cache_file_item_latents_to_disk(
         save_latent_shard_manifest(latent_dir, manifest)
 
 
+def open_control_image(control_path: str, transparent_color) -> Image.Image:
+    """A control (reference) image as RGB: EXIF orientation applied, and transparency filled
+    with `transparent_color`. The same steps as ControlFileItemDTOMixin.load_control_image,
+    for the caller that has to show the text encoder the picture that one shows the VAE."""
+    img = Image.open(control_path)
+    img = exif_transpose(img)
+
+    if img.mode in ("RGBA", "LA"):
+        # Create a background with the specified transparent color
+        background = Image.new("RGB", img.size, tuple(transparent_color))
+        # Paste the image on top using its alpha channel as mask
+        background.paste(img, mask=img.getchannel("A"))
+        img = background
+    else:
+        # Already no alpha channel
+        img = img.convert("RGB")
+    return img
+
+
 def load_control_images_for_text_embedding(file_item: 'FileItemDTO', sd: 'StableDiffusion'):
     if not file_item.encode_control_in_text_embeddings:
         return None
@@ -1031,15 +1050,29 @@ def load_control_images_for_text_embedding(file_item: 'FileItemDTO', sd: 'Stable
     control_path_list = file_item.control_path
     if not isinstance(control_path_list, list):
         control_path_list = [control_path_list]
+    # FORK: control_from_same_folder -- the references are the dataset's own images
+    same_folder = getattr(file_item, 'same_folder_control_pool', None) is not None
     for control_path in control_path_list:
         try:
-            img = Image.open(control_path).convert("RGB")
-            img = exif_transpose(img)
+            if same_folder:
+                # decoded as load_control_image() decodes it for the training step, so the
+                # text encoder and the VAE are shown the same picture (transparency included)
+                img = open_control_image(control_path, file_item.dataset_config.control_transparent_color)
+            else:
+                img = Image.open(control_path).convert("RGB")
+                img = exif_transpose(img)
             img = TF.to_tensor(img).unsqueeze(0).to(sd.device_torch, dtype=sd.torch_dtype)
             ctrl_img_list.append(img)
         except Exception as e:
             print_acc(f"Error: {e}")
             print_acc(f"Error loading control image: {control_path}")
+            if same_folder:
+                # carrying on would cache an embedding made with fewer references than the
+                # training step hands to the model, under a key that lists them all
+                raise RuntimeError(
+                    f"control_from_same_folder: could not load the reference image {control_path} "
+                    f"(for {file_item.path}): {e}"
+                ) from e
 
     if len(ctrl_img_list) == 0:
         return None
@@ -2223,7 +2256,34 @@ class ControlFileItemDTOMixin:
                 # only do one
                 self.control_path = self.control_path[0]
 
+        # FORK: dataset_config.control_from_same_folder -- the references are other images of
+        # this target's own folder. AiToolkitDataset.assign_same_folder_control_images sets
+        # the next two once every file item exists.
+        # the images of this target's folder, itself included (one tuple shared by the folder)
+        self.same_folder_control_pool: Union[tuple, None] = None
+        # choose again on every load, instead of keeping the choice made at setup
+        self.same_folder_control_redraw = False
+        if dataset_config.control_from_same_folder:
+            # each at its own size and aspect ratio (full_size_control_images: false is refused)
+            self.full_size_control_images = True
+
+    def draw_same_folder_control_paths(self: 'FileItemDTO') -> Union[List[str], None]:
+        """A fresh choice of references for this target: other images of its own folder.
+        (Not used when the choice is fixed at setup; see assign_same_folder_control_images.)"""
+        pool = [path for path in (self.same_folder_control_pool or ()) if path != self.path]
+        if len(pool) == 0:
+            return None
+        count_min, count_max = self.dataset_config.control_from_same_folder_count
+        count = min(random.randint(count_min, count_max), len(pool))
+        return random.sample(pool, count)
+
     def load_control_image(self: 'FileItemDTO'):
+        if self.same_folder_control_redraw:
+            self.control_path = self.draw_same_folder_control_paths()
+            if self.control_path is None:
+                self.control_tensor = None
+                self.control_tensor_list = None
+                return
         control_tensors = []
         control_path_list = self.control_path
         if not isinstance(self.control_path, list):
@@ -2247,7 +2307,28 @@ class ControlFileItemDTOMixin:
             except Exception as e:
                 print_acc(f"Error: {e}")
                 print_acc(f"Error loading image: {control_path}")
+                if self.same_folder_control_pool is not None:
+                    # FORK: this is a dataset image that may never have been opened before.
+                    # Carrying on would train this target on the previous reference again, or
+                    # stop a few lines down with nothing that names the file.
+                    raise RuntimeError(
+                        f"control_from_same_folder: could not load the reference image {control_path} "
+                        f"(for {self.path}): {e}"
+                    ) from e
             
+            if self.same_folder_control_pool is not None:
+                # FORK: control_from_same_folder_max_pixels. These references are dataset images
+                # at their own size, usually far larger than the model uses them at. The model
+                # brings them to its size itself, but Krea 2 does that with plain bilinear
+                # interpolation, which aliases when it has to shrink a lot. So the bulk of the
+                # reduction can be done here, with a filter that averages.
+                max_pixels = self.dataset_config.control_from_same_folder_max_pixels
+                w, h = img.size
+                if max_pixels is not None and w * h > max_pixels:
+                    scale = math.sqrt(max_pixels / (w * h))
+                    # rounded down, so that it stays within the limit
+                    img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
+
             if not self.full_size_control_images:
                 # we just scale them to 512x512:
                 w, h = img.size
@@ -2286,9 +2367,11 @@ class ControlFileItemDTOMixin:
             
         if len(control_tensors) == 0:
             self.control_tensor = None
-        elif len(control_tensors) == 1:
+        elif len(control_tensors) == 1 and self.same_folder_control_pool is None:
             self.control_tensor = control_tensors[0]
         elif self.use_raw_control_images:
+            # (same-folder references always come as a list, one image included: targets in
+            # one batch can then have different numbers of them)
             # just send the list of tensors as their shapes wont match
             self.control_tensor_list = control_tensors
         else:

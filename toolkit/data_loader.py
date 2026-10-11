@@ -22,7 +22,7 @@ import albumentations as A
 from toolkit import image_utils
 from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.cache_paths import get_cache_file_candidates, has_sufficient_free_space
-from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
+from toolkit.config_modules import DatasetConfig, check_control_from_same_folder, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
 from toolkit.print import print_acc
@@ -206,6 +206,22 @@ def _filter_files_with_sidecar_captions(
 # the image's latent-token count, independent of aspect ratio (a 512x2048 panorama and
 # a 1024x1024 square both have sqrt=1024 and the same token count).
 LOW_RES_MIN_FRACTION = 0.625
+
+
+def _seeded_order(seed_text: str, paths) -> List[str]:
+    """`paths` in an order that looks random and is fixed by `seed_text` and each file name
+    alone. No path's place depends on which other paths are there: adding or removing one
+    leaves the rest in the same order relative to each other.
+
+    FORK: for dataset_config.control_from_same_folder (the file names are of one folder)."""
+    base = hashlib.sha1(seed_text.encode('utf-8'))
+
+    def rank(path):
+        digest = base.copy()
+        digest.update(os.path.basename(path).encode('utf-8'))
+        return digest.digest()
+
+    return sorted(paths, key=rank)
 
 
 class DatasetBelowResolutionError(ValueError):
@@ -981,6 +997,18 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         else:
             assert len(self.file_list) > 0, f"no {_noun_found} found in {self.dataset_path}"
 
+        # FORK: control_from_same_folder wants to know whether any folder held two images
+        # before the filter below
+        self._folder_pair_before_low_res_filter = False
+        if self.dataset_config.control_from_same_folder:
+            folders_seen = set()
+            for path in {file_item.path for file_item in self.file_list}:
+                folder = os.path.dirname(path)
+                if folder in folders_seen:
+                    self._folder_pair_before_low_res_filter = True
+                    break
+                folders_seen.add(folder)
+
         # Always-on "skip low-res images" filter. An image's effective training
         # resolution is its area-equivalent sqrt(w*h) (= the bucketer's real_resolution
         # and its latent-token count), so we filter on AREA, not min/max side. Drop
@@ -1035,6 +1063,9 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 print_acc(f"  -  Found {len(self.file_list)} videos after adding flips")
             else:
                 print_acc(f"  -  Found {len(self.file_list)} images after adding flips")
+
+        # FORK: before setup_epoch(), which builds the buckets and the caches from file_list
+        self.assign_same_folder_control_images()
 
         self.setup_epoch()
 
@@ -1098,6 +1129,150 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             if self.dataset_config.buckets:
                 # batch indices reference file_list positions; rebuild them
                 self.setup_buckets(quiet=True)
+
+    def assign_same_folder_control_images(self):
+        """FORK: dataset_config.control_from_same_folder.
+
+        Every target's reference (control) images are other images of the target's own
+        folder. With one folder per character, the references then show the same character
+        in different pictures, so a reference-conditioned model has to carry the identity
+        over rather than copy the target. "Other images" are the ones this dataset trains
+        on: an image that was skipped as too small for this resolution is not a reference
+        either.
+
+        When they are chosen:
+          * text embeddings cached, on a model that encodes the references into them: once
+            per target, from a seed, so the cache holds the matching embedding and stays
+            valid from run to run. Each copy of a target that num_repeats or the flips add
+            gets its own choice. A choice only changes when one of its images goes away or
+            a new image ranks ahead of them (see _seeded_order), so editing a folder does
+            not redo the cache for all of it. (A target that takes every other image of
+            its folder, because there are no more than its count, takes a new one too.)
+          * otherwise: again every time a target is loaded.
+        How many comes from control_from_same_folder_count. A target with no other image of
+        its folder in this dataset has nothing to be paired with and is left out.
+
+        control_from_same_folder_max_targets keeps large folders from outweighing small ones:
+        only that many images of a folder, chosen from the seed, are trained as targets. The
+        others are dropped from the dataset but stay available as references.
+        """
+        dataset_config = self.dataset_config
+        if not dataset_config.control_from_same_folder:
+            return
+        # the trainer has run this for every dataset before building the first; again here
+        # for a dataset that is built on its own
+        check_control_from_same_folder(self.sd.model_config if self.sd is not None else None, dataset_config)
+        if not getattr(self.sd, 'use_raw_control_images', False):
+            raise ValueError("control_from_same_folder: the model does not take reference images at their own size")
+
+        seed = dataset_config.control_from_same_folder_seed
+        dataset_root = self.dataset_path if os.path.isdir(self.dataset_path) else os.path.dirname(self.dataset_path)
+
+        def seed_name(path):
+            # the same on every machine and drive, so that the seed strings are too
+            try:
+                return os.path.relpath(path, dataset_root).replace(os.sep, '/')
+            except ValueError:  # another drive on Windows, which only a json file list can reach
+                return path.replace(os.sep, '/')
+
+        folder_paths: Dict[str, set] = {}
+        for file_item in self.file_list:
+            folder_paths.setdefault(os.path.dirname(file_item.path), set()).add(file_item.path)
+        # one sorted tuple per folder, shared by its file items
+        folder_pools = {folder: tuple(sorted(paths)) for folder, paths in folder_paths.items()}
+
+        # the images of each folder that are trained as targets: all, or the first so many
+        max_targets = dataset_config.control_from_same_folder_max_targets
+        folder_targets: Dict[str, set] = {}
+        if max_targets is not None:
+            for folder, pool in folder_pools.items():
+                if len(pool) > max_targets:
+                    order = _seeded_order(f"{seed}|targets|{seed_name(folder)}|", pool)
+                    folder_targets[folder] = set(order[:max_targets])
+
+        count_min, count_max = dataset_config.control_from_same_folder_count
+
+        def fixed_references(file_item, seed_text):
+            others = [path for path in file_item.same_folder_control_pool if path != file_item.path]
+            draw = int.from_bytes(hashlib.sha1(f"{seed_text}count".encode('utf-8')).digest()[:8], 'big')
+            count = min(count_min + draw % (count_max - count_min + 1), len(others))
+            return _seeded_order(seed_text, others)[:count]
+
+        # cached embeddings contain the references, so the choice has to hold still
+        fixed = bool(
+            dataset_config.cache_text_embeddings
+            and getattr(self.sd, 'encode_control_in_text_embeddings', False)
+        )
+        kept: List['FileItemDTO'] = []
+        copies_seen: Dict[str, int] = {}
+        target_paths, alone_paths, reference_only_paths = set(), set(), set()
+        for file_item in self.file_list:
+            folder = os.path.dirname(file_item.path)
+            pool = folder_pools[folder]
+            if len(pool) < 2:
+                alone_paths.add(file_item.path)
+                continue
+            if folder in folder_targets and file_item.path not in folder_targets[folder]:
+                reference_only_paths.add(file_item.path)
+                continue
+            file_item.same_folder_control_pool = pool
+            file_item.has_control_image = True
+            if fixed:
+                copy_index = copies_seen.get(file_item.path, 0)
+                copies_seen[file_item.path] = copy_index + 1
+                file_item.control_path = fixed_references(
+                    file_item, f"{seed}|references|{seed_name(file_item.path)}|{copy_index}|"
+                )
+            else:
+                file_item.same_folder_control_redraw = True
+                file_item.control_path = None
+            target_paths.add(file_item.path)
+            kept.append(file_item)
+        self.file_list = kept
+
+        count_text = f"{count_min}" if count_min == count_max else f"{count_min}-{count_max}"
+        folders_used = sum(1 for pool in folder_pools.values() if len(pool) >= 2)
+        if fixed:
+            when = "chosen once per target for this run (text embeddings are cached)"
+        else:
+            when = "chosen again every time a target is loaded"
+        print_acc(
+            f"  -  References from the same folder: {len(target_paths)} target image(s) in "
+            f"{folders_used} folder(s), {count_text} per target, {when}"
+        )
+        if len(reference_only_paths) > 0:
+            print_acc(
+                f"  -  {len(reference_only_paths)} more image(s) serve as references only "
+                f"(control_from_same_folder_max_targets: {max_targets} per folder)"
+            )
+        if len(alone_paths) > 0:
+            print_acc(
+                f"  -  Left out {len(alone_paths)} image(s) with no other image of their folder "
+                f"in this dataset to pair with"
+            )
+        max_pixels = dataset_config.control_from_same_folder_max_pixels
+        if max_pixels is not None:
+            match_target_res = bool(self.sd.model_config.model_kwargs.get('match_target_res', False))
+            model_limit = getattr(self.sd, '_ref_target_pixels', lambda target_pixels: None)(None)
+            further = ""
+            if not match_target_res and model_limit is not None and model_limit < max_pixels:
+                further = f"; the model then reduces them to its own limit of {model_limit}"
+            print_acc(
+                f"  -  References with more than {max_pixels} pixels are scaled down to that "
+                f"when they are loaded{further}"
+            )
+        if len(self.file_list) == 0:
+            if self._folder_pair_before_low_res_filter:
+                # the low-res filter took the pairs apart; the other resolutions of a
+                # multi-resolution dataset can still have them
+                raise DatasetBelowResolutionError(
+                    f"control_from_same_folder: no folder under {self.dataset_path} has two images "
+                    f"that are large enough for resolution {self.resolution}"
+                )
+            raise ValueError(
+                f"control_from_same_folder: no folder under {self.dataset_path} holds two or more "
+                f"usable images. Point folder_path at the parent of the per-character folders."
+            )
 
     def setup_epoch(self):
         if self.epoch_num == 0:
@@ -1236,6 +1411,12 @@ def _global_bucket_control_arity(file_item: 'FileItemDTO') -> int:
     # control_path is resolved PER FILE ITEM (dataloader_mixins.py ControlFileItemDTOMixin
     # globs for a matching filename; non-matching files get None) and mutated again by
     # add_control_path_to_file_item during setup_controls. Never read it off dataset_config.
+    if getattr(file_item, 'same_folder_control_pool', None) is not None:
+        # FORK: control_from_same_folder. These always carry their references as a list, any
+        # number of them per item, so the count does not have to match within a batch. 0 keeps
+        # them apart from the one-image control_path items (1), whose single stacked tensor
+        # cannot share a batch with a list.
+        return 0
     control_path = getattr(file_item, 'control_path', None)
     if control_path is None:
         return 0

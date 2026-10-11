@@ -956,6 +956,89 @@ class DatasetConfig:
                 control_paths.append(control_path_3)
             self.control_path = control_paths
         
+        # FORK: take each target's reference (control) images from the target's own folder
+        # instead of from control_path: for datasets laid out as one folder per character or
+        # subject, where any other image of the folder can stand as a reference for the target.
+        # The dataset's folder_path is the parent of those folders. See
+        # AiToolkitDataset.assign_same_folder_control_images for how the choices are made.
+        self.control_from_same_folder: bool = kwargs.get('control_from_same_folder', False)
+        # how many references each target gets: a number, or [min, max] to vary it per target.
+        # A folder with fewer other images gives what it has.
+        self.control_from_same_folder_count: Tuple[int, int] = (1, 1)
+        # at most this many images of each folder are trained as targets; the rest of the folder
+        # still serves as references. Evens out folders of very different sizes. None: all of them.
+        self.control_from_same_folder_max_targets: Union[int, None] = None
+        # a reference with more pixels than this (width x height) is scaled down to it, keeping
+        # its aspect ratio, when it is loaded for a training step. Meant to be the size the model
+        # uses references at, so that the reduction is done once, here, with a filter that
+        # averages. None: references are handed over at their own size.
+        self.control_from_same_folder_max_pixels: Union[int, None] = None
+        # for the choices that are fixed for the run
+        self.control_from_same_folder_seed: int = 0
+        if self.control_from_same_folder:
+            if self.control_path is not None:
+                raise ValueError(
+                    "control_from_same_folder takes the reference images from the dataset's own folders; "
+                    "remove control_path / control_path_1..3 from this dataset or turn it off"
+                )
+
+            def setting(key):
+                # the UI writes '' for a field that was left empty
+                value = kwargs.get(key, None)
+                return None if value == '' else value
+
+            def whole_number(key, value):
+                if isinstance(value, int) and not isinstance(value, bool):
+                    return value
+                try:
+                    if isinstance(value, bool) or float(value) != int(float(value)):
+                        raise ValueError
+                    return int(float(value))
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"{key} must be a whole number, got {value!r}") from None
+
+            count = setting('control_from_same_folder_count')
+            if count is None:
+                count = 1
+            try:
+                if isinstance(count, (list, tuple)):
+                    count_min, count_max = [whole_number('control_from_same_folder_count', x) for x in count]
+                else:
+                    count_min = count_max = whole_number('control_from_same_folder_count', count)
+            except ValueError:
+                raise ValueError(
+                    f"control_from_same_folder_count must be a whole number or [min, max], got {count!r}"
+                ) from None
+            if count_min < 1 or count_max < count_min:
+                raise ValueError(
+                    f"control_from_same_folder_count must be 1 or more, with min <= max, got {count!r}"
+                )
+            self.control_from_same_folder_count = (count_min, count_max)
+
+            max_targets = setting('control_from_same_folder_max_targets')
+            if max_targets is not None:
+                max_targets = whole_number('control_from_same_folder_max_targets', max_targets)
+                if max_targets < 1:
+                    raise ValueError(
+                        f"control_from_same_folder_max_targets must be 1 or more, got {max_targets} "
+                        f"(leave it out for no limit)"
+                    )
+                self.control_from_same_folder_max_targets = max_targets
+
+            max_pixels = setting('control_from_same_folder_max_pixels')
+            if max_pixels is not None:
+                max_pixels = whole_number('control_from_same_folder_max_pixels', max_pixels)
+                if max_pixels < 64 * 64:
+                    raise ValueError(
+                        f"control_from_same_folder_max_pixels is a pixel count (width x height), for "
+                        f"example 262144 for 512 x 512; got {max_pixels} (leave it out for no limit)"
+                    )
+                self.control_from_same_folder_max_pixels = max_pixels
+
+            seed = setting('control_from_same_folder_seed')
+            if seed is not None:
+                self.control_from_same_folder_seed = whole_number('control_from_same_folder_seed', seed)
+
         # color for transparent reigon of control images with transparency
         self.control_transparent_color: List[int] = kwargs.get('control_transparent_color', [0, 0, 0])
         # inpaint images should be webp/png images with alpha channel. The alpha 0 (invisible) section will
@@ -1451,12 +1534,89 @@ class GenerateImageConfig:
         self.logger.log_image(image, count, self.prompt)
         
         
+def check_control_from_same_folder(
+        model_config: ModelConfig,
+        dataset_config: DatasetConfig,
+        train_config: Optional[TrainConfig] = None,
+):
+    """FORK: everything about a control_from_same_folder dataset that the configs alone can
+    tell. validate_configs() runs it for every dataset before the model is loaded and before
+    any dataset is scanned or cached; AiToolkitDataset runs it again (without the train
+    config) for a dataset that is built on its own."""
+    if not getattr(dataset_config, 'control_from_same_folder', False):
+        return
+    if (
+            train_config is not None
+            and train_config.unload_text_encoder
+            and not dataset_config.cache_text_embeddings
+    ):
+        raise ValueError(
+            "control_from_same_folder: with train.unload_text_encoder every step is trained on one "
+            "fixed prompt embedding (blank or the trigger word), so neither the captions nor the "
+            "references would reach the text encoder. Use train.cache_text_embeddings instead; it "
+            "unloads the text encoder as well."
+        )
+    model_kwargs = getattr(model_config, 'model_kwargs', None) or {}
+    # The references go to the model as a list per target, each at its own size and aspect
+    # ratio. Other models take control images that way too, but each unpacks them itself and
+    # none of them has been run with this, so only the one that has is let through.
+    if getattr(model_config, 'arch', None) != 'krea2' or not model_kwargs.get('edit', False):
+        raise ValueError(
+            "control_from_same_folder is only supported for Krea 2 in edit mode so far "
+            "(model arch krea2 with model_kwargs.edit: true)"
+        )
+    if dataset_config.num_frames > 1:
+        raise ValueError("control_from_same_folder is for image datasets (num_frames: 1)")
+    if dataset_config.caches_only:
+        raise ValueError(
+            "control_from_same_folder reads the reference images from the dataset folders "
+            "at every step, so it cannot be used with caches_only"
+        )
+    generated_controls = [c for c in dataset_config.controls if c not in ('inpaint', 'mask')]
+    if len(generated_controls) > 0:
+        # they would be added to every target's references
+        raise ValueError(
+            f"control_from_same_folder cannot be combined with generated control images "
+            f"(controls: {generated_controls})"
+        )
+    if not dataset_config.full_size_control_images:
+        raise ValueError(
+            "control_from_same_folder needs full_size_control_images on (the default): "
+            "with it off every reference would be squashed to 512 x 512"
+        )
+    if dataset_config.augmentations and dataset_config.replay_transforms:
+        raise ValueError(
+            "control_from_same_folder cannot be combined with augmentations while replay_transforms "
+            "is on: each target's spatial transforms would be replayed on its references, which "
+            "are other pictures"
+        )
+    max_pixels = dataset_config.control_from_same_folder_max_pixels
+    resolution = dataset_config.resolution
+    if isinstance(resolution, (list, tuple)):
+        resolution = max(resolution) if len(resolution) > 0 else 0
+    resolution = int(resolution)
+    if max_pixels is not None and model_kwargs.get('match_target_res', False) and max_pixels < resolution * resolution:
+        raise ValueError(
+            f"control_from_same_folder_max_pixels is {max_pixels}, less than the "
+            f"{resolution * resolution} pixels of a {resolution} x {resolution} target, while "
+            f"model_kwargs.match_target_res is on, which makes Krea 2 scale every reference to "
+            f"its target's area: the references would be reduced by the dataloader and enlarged "
+            f"again by the model. Turn match_target_res off to use them at the smaller size, or "
+            f"set control_from_same_folder_max_pixels to {resolution * resolution} or more."
+        )
+
+
 def validate_configs(
     train_config: TrainConfig,
     model_config: ModelConfig,
     save_config: SaveConfig,
     dataset_configs: List[DatasetConfig]
 ):
+    # FORK: control_from_same_folder, for every dataset (each resolution of a multi-resolution
+    # dataset is one of them) before any of them is built
+    for dataset_config in dataset_configs:
+        check_control_from_same_folder(model_config, dataset_config, train_config)
+
     if model_config.is_flux:
         if save_config.save_format != 'diffusers':
             # make it diffusers
