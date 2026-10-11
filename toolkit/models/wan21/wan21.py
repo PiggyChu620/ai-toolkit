@@ -381,7 +381,12 @@ class Wan21(BaseModel):
             MemoryManager.attach(
                 transformer,
                 self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent
+                offload_percent=self.model_config.layer_offloading_transformer_percent,
+                # The modulation tables are bare nn.Parameters, not layers. Once the manager
+                # owns .to() it only moves what it tracks, so without this they stay where
+                # they were when it attached -- the CPU under low_vram -- while every block
+                # adds them to activations on the GPU. Same list the 14B loader passes.
+                ignore_modules=[transformer.scale_shift_table] + [block.scale_shift_table for block in transformer.blocks]
             )
         
         if self.model_config.low_vram:
