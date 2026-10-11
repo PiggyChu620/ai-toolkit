@@ -235,16 +235,26 @@ def encode_minimax_h3_prompt(
         token_tags = [TEXT_TAG]
 
     input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-    mm_token_type_ids = torch.tensor(
-        processor.create_mm_token_type_ids([token_ids]), dtype=torch.long, device=device
-    )
+    # FORK: M-RoPE has to know which rows are image/video placeholders.
+    # transformers >= 5 takes that as mm_token_type_ids, built by the processor.
+    # transformers 4.57 -- the version this fork pins, and the only line it
+    # imports under -- has neither the processor helper nor the forward
+    # argument: it works the same positions out from input_ids itself. Calling
+    # the helper unconditionally raised AttributeError on every caption.
+    mm_inputs = {}
+    if hasattr(processor, "create_mm_token_type_ids"):
+        mm_inputs["mm_token_type_ids"] = torch.tensor(
+            processor.create_mm_token_type_ids([token_ids]),
+            dtype=torch.long,
+            device=device,
+        )
 
     # call the inner .model directly: the LM head's vocab projection is dead
     # weight here and hidden_states[50] is all that is consumed
     outputs = text_encoder.model(
         input_ids=input_ids,
         attention_mask=torch.ones_like(input_ids),
-        mm_token_type_ids=mm_token_type_ids,
+        **mm_inputs,
         pixel_values=None
         if pixel_values is None
         else pixel_values.to(device, text_encoder.dtype),
