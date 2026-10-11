@@ -345,6 +345,29 @@ class DataLoaderBatchDTO:
             # just for holding noise and preds during training
             self.audio_target: Union[torch.Tensor, None] = None
             self.audio_pred: Union[torch.Tensor, None] = None
+            # Per-step audio bookkeeping for joint audio+video models (minimax_h3 reads and
+            # writes these in get_noise_prediction). Ported from upstream ostris/ai-toolkit
+            # as of the commit the minimax_h3 extension was copied from.
+            # the noise drawn for the audio stream on the primary (grad enabled)
+            # prediction. Secondary passes (cfg / guidance loss / prior preds)
+            # reuse it so their noisy audio matches the stored audio_target.
+            self.audio_noise: Union[torch.Tensor, None] = None
+            # audio predictions from the non primary passes. Kept separate so
+            # they cannot stomp the primary pred we backprop through.
+            self.audio_pred_uncond: Union[torch.Tensor, None] = None
+            self.audio_pred_prior: Union[torch.Tensor, None] = None
+            self.audio_pred_preservation: Union[torch.Tensor, None] = None
+            # which of the above the current secondary pass writes to. None (the
+            # default) means no secondary pass is in flight: any grad-enabled
+            # prediction is a primary one and writes audio_pred (and the
+            # noisy/sigma bookkeeping) directly. Nothing in this fork's trainer sets
+            # it yet, so predictions made under no_grad (prior / unconditional
+            # passes) are simply not stored -- see set_secondary_audio_pred.
+            self.audio_pred_slot: Union[str, None] = None
+            # noisy audio rows and audio sigma of the primary pass, used to
+            # rebuild the clean audio estimate for perceptual losses
+            self.audio_noisy: Union[torch.Tensor, None] = None
+            self.audio_sigma: Union[torch.Tensor, None] = None
             self.latent_cache_mask: Union[torch.Tensor, None] = None
             self.cached_latent_indices: List[int] = []
             self.missing_latent_indices: List[int] = []
@@ -741,6 +764,15 @@ class DataLoaderBatchDTO:
         self.prompt_embeds = _pin(self.prompt_embeds)
         return self
 
+    def set_secondary_audio_pred(self, pred):
+        """Route an audio prediction from a non primary pass (prior,
+        unconditional/guidance, preservation) to its own slot so it cannot
+        stomp the primary prediction the loss backprops through. Passes that
+        did not declare a slot (e.g. a trainer's extra no_grad prediction)
+        are simply not stored."""
+        if self.audio_pred_slot is not None:
+            setattr(self, self.audio_pred_slot, pred)
+
     def cleanup(self):
         del self.latents
         del self.tensor
@@ -749,6 +781,12 @@ class DataLoaderBatchDTO:
         del self.audio_data
         del self.audio_target
         del self.audio_pred
+        del self.audio_noise
+        del self.audio_pred_uncond
+        del self.audio_pred_prior
+        del self.audio_pred_preservation
+        del self.audio_noisy
+        del self.audio_sigma
         del self.first_frame_latents
         del self.first_frame_conditions
         del self.audio_latents
