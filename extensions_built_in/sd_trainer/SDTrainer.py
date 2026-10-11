@@ -2011,6 +2011,23 @@ class SDTrainer(BaseSDTrainProcess):
                                 self.sd.text_encoder.eval()
                             if isinstance(self.adapter, CustomAdapter):
                                 self.adapter.is_unconditional_run = False
+                            if self.sd.encode_control_in_text_embeddings and batch.control_tensor_list is not None:
+                                # FORK (ported from upstream): several raw reference images per item
+                                # arrive as per-item lists, not as the stacked control_tensor handled
+                                # above. Without this the prompt was encoded without them while the
+                                # model still got their latents. Same device/dtype treatment as the
+                                # single-image case, so the embedding matches the cached one.
+                                prompt_kwargs['control_images'] = [
+                                    [
+                                        self._move_to_device(
+                                            control_image,
+                                            device=self.sd.device_torch,
+                                            dtype=self.sd.torch_dtype,
+                                        )
+                                        for control_image in item_control_images
+                                    ]
+                                    for item_control_images in batch.control_tensor_list
+                                ]
                             conditional_embeds = self.sd.encode_prompt(
                                 conditioned_prompts, prompt_2,
                                 dropout_prob=self.train_config.prompt_dropout_prob,
