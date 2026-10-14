@@ -970,6 +970,16 @@ class DatasetConfig:
         # them. 'min': as many as the smallest folder has, so that every folder gives the same
         # number (worked out once the dataset has been scanned).
         self.control_from_same_folder_max_targets: Union[int, str, None] = None
+        # every folder gives this many targets in one pass over the dataset, whatever its size. A
+        # pass is one copy of the dataset: num_repeats of them, twice as many with each flip. A
+        # number, or 'median', 'mean' or 'min' of the folder sizes (worked out once the dataset
+        # has been scanned). A folder with more images gives other ones in each pass; a folder
+        # with fewer gives its images more than once, each copy with references of its own
+        # choosing, though a target no more often per pass than the other images of its folder
+        # can serve it, the smallest count at a time, without one of them serving twice. A number
+        # above the size of the largest folder is brought down to it. Instead of max_targets, not
+        # together with it.
+        self.control_from_same_folder_targets_per_folder: Union[int, str, None] = None
         # a reference with more pixels than this (width x height) is scaled down to it, keeping
         # its aspect ratio, when it is loaded for a training step. Meant to be the size the model
         # uses references at, so that the reduction is done once, here, with a filter that
@@ -1024,9 +1034,12 @@ class DatasetConfig:
                 try:
                     max_targets = whole_number('control_from_same_folder_max_targets', max_targets)
                 except ValueError:
+                    elsewhere = ""
+                    if isinstance(max_targets, str) and max_targets.strip().lower() in ('median', 'mean', 'average'):
+                        elsewhere = " (median and mean go in control_from_same_folder_targets_per_folder)"
                     raise ValueError(
                         f"control_from_same_folder_max_targets must be a whole number or min, "
-                        f"got {max_targets!r}"
+                        f"got {max_targets!r}{elsewhere}"
                     ) from None
                 if max_targets < 1:
                     raise ValueError(
@@ -1034,6 +1047,33 @@ class DatasetConfig:
                         f"(leave it out for no limit)"
                     )
                 self.control_from_same_folder_max_targets = max_targets
+
+            per_folder = setting('control_from_same_folder_targets_per_folder')
+            if isinstance(per_folder, str) and per_folder.strip().lower() in ('min', 'median', 'mean', 'average'):
+                per_folder = per_folder.strip().lower()
+                self.control_from_same_folder_targets_per_folder = 'mean' if per_folder == 'average' else per_folder
+            elif per_folder is not None:
+                try:
+                    per_folder = whole_number('control_from_same_folder_targets_per_folder', per_folder)
+                except ValueError:
+                    raise ValueError(
+                        f"control_from_same_folder_targets_per_folder must be a whole number, median, "
+                        f"mean or min, got {per_folder!r}"
+                    ) from None
+                if per_folder < 1:
+                    raise ValueError(
+                        f"control_from_same_folder_targets_per_folder must be 1 or more, got {per_folder} "
+                        f"(leave it out to train every image once per pass)"
+                    )
+                self.control_from_same_folder_targets_per_folder = per_folder
+            if (
+                    self.control_from_same_folder_targets_per_folder is not None
+                    and self.control_from_same_folder_max_targets is not None
+            ):
+                raise ValueError(
+                    "control_from_same_folder_targets_per_folder and control_from_same_folder_max_targets "
+                    "both set how many targets a folder gives; keep one of them"
+                )
 
             max_pixels = setting('control_from_same_folder_max_pixels')
             if max_pixels is not None:

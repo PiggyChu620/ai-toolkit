@@ -1143,20 +1143,47 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         When they are chosen:
           * text embeddings cached, on a model that encodes the references into them: once
             per target, from a seed, so the cache holds the matching embedding and stays
-            valid from run to run. Each copy of a target that num_repeats or the flips add
-            gets its own choice. A choice only changes when one of its images goes away or
-            a new image ranks ahead of them (see _seeded_order), so editing a folder does
-            not redo the cache for all of it. (A target that takes every other image of
-            its folder, because there are no more than its count, takes a new one too.)
+            valid from run to run. A target that is in the dataset more than once (through
+            num_repeats, the flips or targets_per_folder) gets a choice for each of its
+            copies, pass by pass. Every copy ranks the other images of the folder in an order
+            of its own (see _seeded_order) and takes the first ones that no earlier copy of
+            the same target has taken; when the images left would not do for a copy, a new
+            round starts with all of them. So within a round no image serves the same target
+            twice, and a round leaves out fewer images than the copy that ends it takes
+            (none, with a count of one). A copy's choice changes when one of its images goes
+            away, when a new image ranks ahead of them, when an earlier copy of its round
+            changes in a way that takes or frees one of them, or when the rounds end
+            elsewhere (as they do in a folder that gains or loses an image): editing a
+            folder redoes part of its cache, more of it the more copies a target has. The
+            first copy of a target is not touched by the others. (A target that takes every
+            other image of its folder, because there are no more than its count, takes a new
+            one too.)
           * otherwise: again every time a target is loaded.
         How many comes from control_from_same_folder_count. A target with no other image of
         its folder in this dataset has nothing to be paired with and is left out.
 
-        control_from_same_folder_max_targets keeps large folders from outweighing small ones:
-        only that many images of a folder, chosen from the seed, are trained as targets. The
-        others are dropped from the dataset but stay available as references. 'min' takes
-        the number from the dataset: as many as the smallest folder that has a pair, so
-        that every folder gives the same number of targets.
+        Two settings keep large folders from outweighing small ones (one or the other):
+          * control_from_same_folder_max_targets: only that many images of a folder, chosen
+            from the seed, are trained as targets, the same ones in every pass. The others
+            are dropped from the dataset but stay available as references. A folder with
+            fewer images gives what it has. 'min' takes the number from the dataset: as many
+            as the smallest folder that has a pair.
+          * control_from_same_folder_targets_per_folder: every folder gives that many
+            targets per pass, a pass being one copy of the dataset as num_repeats and the
+            flips make them. The images of a folder are put in an order by the seed and
+            handed out in turn, going round as often as it takes. So a folder with more
+            images than a pass takes gives other ones in the next pass, and a folder with
+            fewer gives its images several times, each copy with a choice of references of
+            its own (above). 'median', 'mean' and 'min' take the number from the sizes of
+            the folders that have a pair. Two limits:
+              - a target comes up only as often per pass as the other images of its folder
+                can serve it without one of them serving twice, at count_min a time: a
+                folder of n images gives at most n x max(1, (n - 1) // count_min) per pass.
+                With a fixed count, no pairing of a target with its references then comes
+                up more often than there are passes;
+              - a number larger than the largest folder is brought down to its size: every
+                folder would only repeat its images within a pass, which is what
+                num_repeats is for.
         """
         dataset_config = self.dataset_config
         if not dataset_config.control_from_same_folder:
@@ -1182,14 +1209,30 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             folder_paths.setdefault(os.path.dirname(file_item.path), set()).add(file_item.path)
         # one sorted tuple per folder, shared by its file items
         folder_pools = {folder: tuple(sorted(paths)) for folder, paths in folder_paths.items()}
+        # the folders that have a pair, in an order that is the same on every machine
+        paired = sorted((folder for folder, pool in folder_pools.items() if len(pool) >= 2), key=seed_name)
 
-        # the images of each folder that are trained as targets: all, or the first so many
+        def folder_sizes(which):
+            """'min', 'median' or 'mean' of the sizes of the folders that have a pair, as a
+            whole number (a half rounds up)."""
+            sizes = sorted(len(folder_pools[folder]) for folder in paired)
+            if len(sizes) == 0:
+                return None
+            if which == 'min':
+                return sizes[0]
+            if which == 'median':
+                middle = len(sizes) // 2
+                if len(sizes) % 2 == 1:
+                    return sizes[middle]
+                return (sizes[middle - 1] + sizes[middle] + 1) // 2
+            return (2 * sum(sizes) + len(sizes)) // (2 * len(sizes))
+
+        # the images of each folder that are trained as targets: all, or the first so many ...
         max_targets = dataset_config.control_from_same_folder_max_targets
         smallest_text = None
         if max_targets == 'min':
             # as many as the smallest folder that has a pair
-            paired = [folder for folder, pool in folder_pools.items() if len(pool) >= 2]
-            max_targets = min((len(folder_pools[folder]) for folder in paired), default=None)
+            max_targets = folder_sizes('min')
             smallest = sorted(seed_name(folder) for folder in paired if len(folder_pools[folder]) == max_targets)
             if len(smallest) > 0:
                 smallest_text = smallest[0] + (f" and {len(smallest) - 1} more" if len(smallest) > 1 else "")
@@ -1202,11 +1245,95 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
 
         count_min, count_max = dataset_config.control_from_same_folder_count
 
-        def fixed_references(file_item, seed_text):
-            others = [path for path in file_item.same_folder_control_pool if path != file_item.path]
+        # ... or so many per folder and pass, going round the folder's images
+        per_folder = dataset_config.control_from_same_folder_targets_per_folder
+        passes = 0
+        per_pass: Dict[str, int] = {}  # what each folder gives per pass
+        in_turn: List['FileItemDTO'] = []  # its targets, pass by pass
+        if per_folder is not None and len(paired) > 0:
+            sizes = sorted(len(folder_pools[folder]) for folder in paired)
+            if isinstance(per_folder, str):
+                how, per_folder = f"{per_folder} -> ", folder_sizes(per_folder)
+                note = ""
+            elif per_folder > sizes[-1]:
+                # every folder would only repeat its images within a pass, which num_repeats
+                # does. (It also keeps a number of another kind, typed here by mistake, within
+                # what the largest folder could give.)
+                how, per_folder = f"{per_folder} -> ", sizes[-1]
+                note = ", the size of the largest folder (num_repeats gives more passes)"
+            else:
+                how = note = ""
+            # the copies that num_repeats and the flips made of every image, in the order they
+            # were made: the p-th copy of each image is the one of pass p. (An image that has
+            # fewer copies than the others, because a read failed once, lends another of its
+            # copies to the passes it misses, which may be flipped differently.)
+            copies: Dict[str, list] = {}
+            for file_item in self.file_list:
+                copies.setdefault(file_item.path, []).append(file_item)
+            passes = max(len(copies[path]) for folder in paired for path in folder_pools[folder])
+            for folder in paired:
+                # a target only as often per pass as the other images of its folder can serve it
+                # without one of them serving twice (they go count_min at a time, at least)
+                size = len(folder_pools[folder])
+                per_pass[folder] = min(per_folder, size * max(1, (size - 1) // count_min))
+            # (said before the copies are made)
+            print_acc(
+                f"  -  control_from_same_folder_targets_per_folder: {how}{per_folder} per folder and "
+                f"pass{note} (the folders hold {sizes[0]} to {sizes[-1]} images)"
+            )
+            flips = dataset_config.flip_x or dataset_config.flip_y
+            fewer = sum(1 for folder in paired if per_pass[folder] < per_folder)
+            total = sum(per_pass.values()) * passes
+            if fewer == 0:
+                each = f"{per_folder * passes} target(s) from each of the {len(paired)} folder(s), {total} in all"
+            else:
+                each = (f"{per_folder * passes} target(s) from each of {len(paired) - fewer} folder(s) and "
+                        f"fewer from {fewer}, {total} in all")
+            print_acc(f"  -  {passes} pass(es) (num_repeats{', times the flips' if flips else ''}): {each}")
+            used = set()  # id() of the file items that stay
+            added: List['FileItemDTO'] = []
+            for folder in paired:
+                order = _seeded_order(f"{seed}|targets|{seed_name(folder)}|", folder_pools[folder])
+                for slot in range(per_pass[folder] * passes):
+                    path_copies = copies[order[slot % len(order)]]
+                    source = path_copies[(slot // per_pass[folder]) % len(path_copies)]
+                    if id(source) not in used:
+                        used.add(id(source))
+                    else:
+                        # this pass has the image already (its folder holds fewer than it
+                        # gives): one more of it. What a file item holds besides plain values
+                        # at this point (its config, its transforms) is only read, and every
+                        # fetch works on a deep copy of the item, so a shallow copy will do.
+                        source = copy.copy(source)
+                        added.append(source)
+                    in_turn.append(source)
+            # the ones that are there already keep their order; the folders without a pair
+            # stay for the loop below to count them
+            self.file_list = [
+                file_item for file_item in self.file_list
+                if id(file_item) in used or len(folder_pools[os.path.dirname(file_item.path)]) < 2
+            ] + added
+
+        # per target: how many copies of it have their references, and the images those copies
+        # have taken in the round that is under way
+        reference_rounds: Dict[str, tuple] = {}
+
+        def fixed_references(file_item):
+            """The references of one more copy of this target."""
+            path = file_item.path
+            others = [other for other in file_item.same_folder_control_pool if other != path]
+            copy_index, taken = reference_rounds.get(path, (0, frozenset()))
+            # every copy ranks the folder's other images in an order of its own ...
+            seed_text = f"{seed}|references|{seed_name(path)}|{copy_index}|"
             draw = int.from_bytes(hashlib.sha1(f"{seed_text}count".encode('utf-8')).digest()[:8], 'big')
             count = min(count_min + draw % (count_max - count_min + 1), len(others))
-            return _seeded_order(seed_text, others)[:count]
+            if count > len(others) - len(taken):
+                # too few left that no earlier copy has had: a new round, with all of them
+                taken = frozenset()
+            # ... and takes the first ones that no earlier copy has taken in this round
+            references = [other for other in _seeded_order(seed_text, others) if other not in taken][:count]
+            reference_rounds[path] = (copy_index + 1, taken.union(references))
+            return references
 
         # cached embeddings contain the references, so the choice has to hold still
         fixed = bool(
@@ -1214,8 +1341,8 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
             and getattr(self.sd, 'encode_control_in_text_embeddings', False)
         )
         kept: List['FileItemDTO'] = []
-        copies_seen: Dict[str, int] = {}
         target_paths, alone_paths, reference_only_paths = set(), set(), set()
+        folder_targets_made: Dict[str, int] = {}
         for file_item in self.file_list:
             folder = os.path.dirname(file_item.path)
             pool = folder_pools[folder]
@@ -1227,21 +1354,37 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 continue
             file_item.same_folder_control_pool = pool
             file_item.has_control_image = True
-            if fixed:
-                copy_index = copies_seen.get(file_item.path, 0)
-                copies_seen[file_item.path] = copy_index + 1
-                file_item.control_path = fixed_references(
-                    file_item, f"{seed}|references|{seed_name(file_item.path)}|{copy_index}|"
-                )
-            else:
+            if not fixed:
                 file_item.same_folder_control_redraw = True
                 file_item.control_path = None
+            folder_targets_made[folder] = folder_targets_made.get(folder, 0) + 1
             target_paths.add(file_item.path)
             kept.append(file_item)
         self.file_list = kept
+        if passes > 0:
+            # the images that no pass got round to
+            reference_only_paths = {path for folder in paired for path in folder_pools[folder]} - target_paths
+        # (how many targets of each folder have the references that another copy of the same
+        # image has: for the report)
+        pairings, folder_repeats = set(), {}
+        if fixed:
+            # The copies of a target take their references pass by pass, so that a round's
+            # choices fall to the copies of one pass (with the flips: of one flip state) as far
+            # as they go. Without targets_per_folder the file list is in that order already.
+            for file_item in (in_turn if passes > 0 else kept):
+                file_item.control_path = fixed_references(file_item)
+                pairing = (
+                    file_item.path, getattr(file_item, 'flip_x', False), getattr(file_item, 'flip_y', False),
+                    frozenset(file_item.control_path),
+                )
+                if pairing in pairings:
+                    folder = os.path.dirname(file_item.path)
+                    folder_repeats[folder] = folder_repeats.get(folder, 0) + 1
+                else:
+                    pairings.add(pairing)
 
         count_text = f"{count_min}" if count_min == count_max else f"{count_min}-{count_max}"
-        folders_used = sum(1 for pool in folder_pools.values() if len(pool) >= 2)
+        folders_used = len(paired)
         if fixed:
             when = "chosen once per target for this run (text embeddings are cached)"
         else:
@@ -1255,10 +1398,49 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 f"  -  control_from_same_folder_max_targets: min -> {max_targets} per folder, "
                 f"the size of the smallest folder ({smallest_text})"
             )
-        if len(reference_only_paths) > 0:
+        if passes > 0:
+            def described(folder):
+                return f"{seed_name(folder)}, {len(folder_pools[folder])} images"
+
+            repeating = [folder for folder in paired if per_pass[folder] > len(folder_pools[folder])]
+            if len(repeating) > 0:
+                most = min(repeating, key=lambda folder: (
+                    -per_pass[folder] / len(folder_pools[folder]), seed_name(folder)))
+                print_acc(
+                    f"  -  {len(repeating)} folder(s) give more targets per pass than they hold images, so an "
+                    f"image of theirs is a target more than once per pass (the most in {described(most)}: "
+                    f"about {per_pass[most] / len(folder_pools[most]):.1f} times each)"
+                )
+            limited = [folder for folder in paired if per_pass[folder] < per_folder]
+            if len(limited) > 0:
+                smallest = min(limited, key=lambda folder: (len(folder_pools[folder]), seed_name(folder)))
+                print_acc(
+                    f"  -  {len(limited)} folder(s) hold too few images to give {per_folder} per pass: a target "
+                    f"comes up only as often per pass as the other images of its folder can serve it, "
+                    f"{count_min} at a time, without one of them serving twice (the smallest: "
+                    f"{described(smallest)}, gives {per_pass[smallest]} per pass)"
+                )
+            if len(reference_only_paths) > 0:
+                more = sum(1 for folder in paired if len(folder_pools[folder]) > per_pass[folder] * passes)
+                print_acc(
+                    f"  -  {len(reference_only_paths)} more image(s) serve as references only "
+                    f"({more} folder(s) hold more than the {per_folder * passes} that are used)"
+                )
+        elif len(reference_only_paths) > 0:
             print_acc(
                 f"  -  {len(reference_only_paths)} more image(s) serve as references only "
                 f"(control_from_same_folder_max_targets: {max_targets} per folder)"
+            )
+        if len(folder_repeats) > 0:
+            # by chance now and then; a folder where it is most of them holds too few images
+            # for the number of times its targets come up
+            most = min(folder_repeats, key=lambda folder: (
+                -folder_repeats[folder] / folder_targets_made[folder], -folder_repeats[folder], seed_name(folder)))
+            flipped = " flipped the same way" if dataset_config.flip_x or dataset_config.flip_y else ""
+            print_acc(
+                f"  -  {sum(folder_repeats.values())} of the {len(self.file_list)} targets have the same "
+                f"references as another copy of the same image{flipped} (most in {seed_name(most)}, "
+                f"{len(folder_pools[most])} images: {folder_repeats[most]} of its {folder_targets_made[most]})"
             )
         if len(alone_paths) > 0:
             print_acc(
